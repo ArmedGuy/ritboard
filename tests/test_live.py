@@ -53,7 +53,8 @@ def test_mcp_flow_with_live_push(server):
         async with websockets.connect(server.replace("http", "ws") + "/ws") as sock:
             async with Client(server + "/mcp") as c:
                 names = {t.name for t in (await c.list_tools()).tools}
-                assert {"add_finding", "place_findings", "link_findings", "create_board"} <= names
+                assert {"add_finding", "place_findings", "create_board"} <= names
+                assert not any("link" in n for n in names)
 
                 ws = data(await c.call_tool("create_workspace", {"name": "GPU perf"}))
                 wid = ws["workspace"]["id"]
@@ -77,9 +78,8 @@ def test_mcp_flow_with_live_push(server):
                     "workspace": wid, "board_id": board["id"],
                     "findings": [{"title": "Profile", "kind": "csv", "content": "k,v\nsm,80"}, {"title": "Doc", "kind": "html", "content": "<h1>x</h1>"}],
                 }))["added"]
-                link = data(await c.call_tool("link_findings", {"workspace": wid, "board_id": "Wall", "from_id": f1["id"], "to_id": added[0]["id"], "label": "explains"}))
-                view = data(await c.call_tool("get_board", {"workspace": wid, "board_id": board["id"]}))
-                assert len(view["placements"]) == 3 and view["links"][0]["id"] == link["id"]
+                view = data(await c.call_tool("get_board", {"workspace": wid, "board_id": "Wall"}))
+                assert len(view["placements"]) == 3
 
                 view = data(await c.call_tool("update_board", {"workspace": wid, "board_id": board["id"], "width": 300}))
                 assert len(view["out_of_bounds"]) >= 2

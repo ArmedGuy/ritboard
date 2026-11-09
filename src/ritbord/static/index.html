@@ -11,7 +11,7 @@
 <div id="viewport">
   <div id="stage">
     <div id="board">
-      <svg id="links" xmlns="http://www.w3.org/2000/svg"></svg>
+      <div id="ruler"></div>
       <div id="cards"></div>
       <svg id="overlay" xmlns="http://www.w3.org/2000/svg"></svg>
     </div>
@@ -126,8 +126,16 @@
 
     <section>
       <h3>This screen</h3>
+      <label>Theme
+        <select name="d_theme">
+          <option value="mat">Cutting mat, green</option>
+          <option value="blue">Cutting mat, blue</option>
+          <option value="graphite">Graphite</option>
+          <option value="paper">Paper (light)</option>
+        </select>
+      </label>
       <label class="check"><input type="checkbox" name="d_device"> 1 board pixel = 1 device pixel (ignore OS display scaling)</label>
-      <label class="check"><input type="checkbox" name="d_grid"> Show grid</label>
+      <label class="check"><input type="checkbox" name="d_grid"> Show grid and ruler</label>
       <label class="check"><input type="checkbox" name="d_snap"> Snap to grid (hold Alt to override)</label>
       <p class="hint" id="set-dpr"></p>
     </section>

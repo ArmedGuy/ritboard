@@ -42,7 +42,7 @@ def test_findings_tree_and_render(reg):
     assert st.delete_finding(root["id"], recursive=True)["deleted"] == 2
 
 
-def test_placements_links_bounds(reg):
+def test_placements_and_bounds(reg):
     st = reg.create("T")
     board = st.list_boards()[0]
     f1 = st.add_finding("one")
@@ -53,13 +53,9 @@ def test_placements_links_bounds(reg):
     st.place(board["id"], [{"finding_id": f1["id"], "x": 3000, "y": 1900}])
     p = st.placements(board["id"])[0]
     assert (p["x"], p["y"], p["w"]) == (3000, 1900, 420)  # size kept
-    link = st.add_link(board["id"], f1["id"], f2["id"], "feeds")
     view = st.board_view(board["name"])  # by name
     assert view["out_of_bounds"] == [f1["id"]]
-    assert view["links"][0]["visible"]
     st.update_board(board["id"], width=8000, height=4000)
     assert st.board_view(board["id"])["out_of_bounds"] == []
     st.unplace(board["id"], [f2["id"]])
-    assert not st.board_view(board["id"])["links"][0]["visible"]
-    st.delete_link(link["id"])
-    assert st.links() == []
+    assert len(st.board_view(board["id"])["placements"]) == 1

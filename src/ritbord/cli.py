@@ -46,8 +46,29 @@ def _build(args):
     return cfg, create_app(cfg)
 
 
+def _check_port(host: str, port: int) -> None:
+    """Fail early with a readable message instead of a bare socket error."""
+    fam = socket.AF_INET6 if ":" in host else socket.AF_INET
+    with socket.socket(fam, socket.SOCK_STREAM) as s:
+        try:
+            s.bind((host, port))
+        except OSError as e:
+            hint = ""
+            if sys.platform == "win32" and getattr(e, "winerror", None) == 10013:
+                hint = (
+                    "\nWindows has reserved this port (often Hyper-V or WSL). See the blocked ranges with:\n"
+                    "  netsh interface ipv4 show excludedportrange protocol=tcp\n"
+                    "and pick a port outside them, e.g. --port 5170."
+                )
+            elif getattr(e, "errno", None) in (98, 48) or getattr(e, "winerror", None) == 10048:
+                hint = "\nSomething is already listening there. Stop it or pick another --port."
+            raise SystemExit(f"Can't listen on {host}:{port}: {e.strerror or e}{hint}")
+
+
 def cmd_serve(args) -> None:
     import uvicorn
+
+    _check_port(args.host, args.port)
 
     if args.host not in ("127.0.0.1", "localhost", "::1") and not args.token:
         print("warning: listening beyond localhost without --token; anyone on the network can edit boards", file=sys.stderr)

@@ -23,7 +23,6 @@ Model:
 - A board is a tab with a fixed pixel size (e.g. 3840x2160). A finding only shows on a board
   once placed there. Coordinates are exact board pixels, origin top-left. Leave x/y out and
   Ritbord picks a free spot.
-- Links connect two findings on one board, drawn as arrows with an optional label.
 Prefer html or md content you write yourself over external URLs; many sites refuse framing.
 Read get_board before rearranging so you don't stack cards on top of each other.
 """
@@ -238,7 +237,7 @@ def build_mcp(reg: Registry, ui_state: dict[str, Any]) -> MCPServer:
         height: int | None = None,
         background: str | None = None,
     ) -> dict[str, Any]:
-        """Rename or resize a board. Resizing never moves cards; cards left outside are reported."""
+        """Rename or resize a board (pixels). Resizing never moves cards; cards left outside are reported."""
         st = reg.get(workspace)
         kw: dict[str, Any] = {"name": name, "width": width, "height": height}
         if background is not None:
@@ -254,7 +253,7 @@ def build_mcp(reg: Registry, ui_state: dict[str, Any]) -> MCPServer:
 
     @mcp.tool()
     async def get_board(workspace: str, board_id: str) -> dict[str, Any]:
-        """A board with every placement (pixel geometry, title) and its links."""
+        """A board with every placement (pixel geometry, title, out-of-bounds flag)."""
         return reg.get(workspace).board_view(board_id)
 
     @mcp.tool()
@@ -269,26 +268,5 @@ def build_mcp(reg: Registry, ui_state: dict[str, Any]) -> MCPServer:
     async def remove_from_board(workspace: str, board_id: str, finding_ids: list[str]) -> dict[str, Any]:
         """Take findings off a board. They stay in the workspace tree."""
         return {"removed": reg.get(workspace).unplace(board_id, finding_ids)}
-
-    # ---- links ----------------------------------------------------------
-    @mcp.tool()
-    async def link_findings(
-        workspace: str, board_id: str, from_id: str, to_id: str, label: str = "", color: str | None = None
-    ) -> dict[str, Any]:
-        """Draw an arrow from one finding to another on a board. Both should be placed there."""
-        return reg.get(workspace).add_link(board_id, from_id, to_id, label, color)
-
-    @mcp.tool()
-    async def update_link(
-        workspace: str, link_id: str, label: str | None = None, color: str | None = None
-    ) -> dict[str, Any]:
-        """Change a link's label or color."""
-        return reg.get(workspace).update_link(link_id, label=label, color=color)
-
-    @mcp.tool()
-    async def unlink(workspace: str, link_id: str) -> dict[str, Any]:
-        """Remove a link."""
-        reg.get(workspace).delete_link(link_id)
-        return {"deleted": link_id}
 
     return mcp

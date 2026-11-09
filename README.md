@@ -1,8 +1,8 @@
 # Ritbord
 
 A planning board for big screens. Agents post findings over MCP, sort them into a tree,
-put them on boards at exact pixel positions, and link them. You arrange and edit the same
-board in a browser or a native window. Changes show up live everywhere.
+and put them on boards at exact pixel positions. You arrange and edit the same board in a
+browser or a native window. Changes show up live everywhere.
 
 ## Run
 
@@ -11,6 +11,13 @@ uv sync
 uv run ritbord serve                 # http://127.0.0.1:8765, MCP at /mcp
 uv run python scripts/demo_seed.py   # optional: a demo workspace, written over MCP
 ```
+
+While working on Ritbord itself, `uv run ritbord serve --dev` restarts on Python changes and
+reloads open browsers when the UI files change.
+
+On Windows, error 10013 on start means the port is in a range Hyper-V or WSL reserved.
+`netsh interface ipv4 show excludedportrange protocol=tcp` lists them; pick another `--port`
+(or set `RITBORD_PORT`).
 
 Native window instead of a browser tab (uses the system webview, not a bundled Chromium):
 
@@ -33,7 +40,7 @@ claude mcp add --transport http ritbord http://127.0.0.1:8765/mcp
 Tools: `list_workspaces`, `current_workspace`, `create_workspace`, `update_workspace`,
 `get_overview`, `list_findings`, `get_finding`, `add_finding`, `add_findings`,
 `update_finding`, `delete_finding`, `create_board`, `update_board`, `delete_board`,
-`get_board`, `place_findings`, `remove_from_board`, `link_findings`, `update_link`, `unlink`.
+`get_board`, `place_findings`, `remove_from_board`.
 
 claude.ai can't reach a server on your LAN. To connect it there you need an HTTPS tunnel
 and `--token`.
@@ -46,12 +53,16 @@ and `--token`.
 - **Board**: a tab with a fixed size in pixels. Change it in Settings or over MCP at any time.
   Resizing never moves cards; cards left outside are outlined and listed under *On board*.
 - **Placement**: a finding on a board at `x, y, w, h`. A finding can sit on several boards.
-- **Link**: an arrow between two findings on one board, with an optional label.
 
 ## Screen
 
-The board is drawn at its set size and never reflows when the window changes. Pan and zoom
-are per screen and remembered.
+The board is drawn at its set size and never reflows when the window changes. A board larger
+than the window pans; you can pan a little past each edge, where the darker hatched area
+shows you're off the board. Pan and zoom are per screen and remembered.
+
+Themes (Settings → This screen): green cutting mat (default), blue cutting mat, graphite,
+and paper. The mat has fine lines every 20 px, heavier ones every 100 px, and pixel numbers
+along the top and left edges. A board can still have its own background colour.
 
 With *1 board pixel = 1 device pixel* on (Settings → This screen), OS display scaling is
 cancelled out, so a 3840×2160 board fills a 4K panel exactly at 150% or 200% Windows scaling.
@@ -60,13 +71,12 @@ cancelled out, so a 3840×2160 board fills a 4K panel exactly at 150% or 200% Wi
 |---|---|
 | drag header | move (snaps to grid, Alt to override) |
 | drag corner | resize |
-| drag the dot on a card's right edge | link to another card |
-| drag in empty space | select several |
-| Space + drag, middle drag, wheel | pan |
+| drag empty space, middle drag, Space + drag, wheel | pan |
+| Shift + drag empty space | select several |
 | Ctrl + wheel, `+` `-` | zoom |
 | `F` / `1` | fit / actual size |
 | arrows, Shift + arrows | nudge 1 px / one grid step |
-| Delete | take selection off the board (or delete the selected link) |
+| Delete | take selection off the board |
 | Enter, double-click header | edit |
 | `\` | findings panel |
 | `H` | hide bars (move the mouse to the top edge to bring the bar back) |

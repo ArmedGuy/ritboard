@@ -53,9 +53,6 @@ async def main():
             "add_finding", title="Proposed fix", category="action", source="you", board_id=board, x=1340, y=240, w=380, h=200,
             content="Pin checkpoint traffic to `mlx5_1` on nodes 12–15.\n\n- [ ] Change `CKPT_IFACE`\n- [ ] Rerun 6k steps",
         ))
-        await call("link_findings", board_id=board, from_id=cpt["id"], to_id=a["id"], label="causes")
-        await call("link_findings", board_id=board, from_id=b["id"], to_id=a["id"], label="confirms")
-        await call("link_findings", board_id=board, from_id=chart["id"], to_id=fix["id"], label="motivates")
         await call("create_board", name="Timeline", width=7680, height=2160)
         print("workspace:", w)
 

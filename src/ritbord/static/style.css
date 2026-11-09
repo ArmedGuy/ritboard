@@ -7,17 +7,42 @@
   --chrome-dim: #8b929b;
   --accent: #4fa3a9;
   --danger: #d1495b;
-  --void: #121417;
-  --board: #ecebe6;
-  --ink: #1d1f23;
-  --ink-dim: #5d636b;
-  --card: #ffffff;
-  --card-line: #d6d4cd;
-  --link: #59616c;
-  --sel: #1f7a80;
   --font: system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", sans-serif;
   --mono: ui-monospace, "Cascadia Mono", "SF Mono", Menlo, Consolas, monospace;
   --bar-h: 40px;
+}
+
+/* ---- themes -----------------------------------------------------------
+   --void        outside the board
+   --mat         board surface; --mat-minor/--mat-major grid lines; --mat-text ruler numbers
+   --card*       cards; --ink text on cards; --sel selection */
+:root, :root[data-theme="mat"] {
+  --void: #0a0d0c; --edge: rgba(0,0,0,.65);
+  --mat: #1f3d32; --mat-minor: rgba(214,240,226,.075); --mat-major: rgba(214,240,226,.19); --mat-text: rgba(214,240,226,.42);
+  --card: #1c2125; --card-head: #222a2e; --card-line: #343c42; --ink: #e3e7ea; --ink-dim: #93a0a8;
+  --code-bg: #2a3237; --rule: #3a444a; --th-bg: #262e33; --a: #7cc4d4; --sel: #e8c26a;
+  --shadow: 0 1px 2px rgba(0,0,0,.35), 0 6px 18px rgba(0,0,0,.28);
+}
+:root[data-theme="blue"] {
+  --void: #080b10; --edge: rgba(0,0,0,.65);
+  --mat: #1c3554; --mat-minor: rgba(214,228,245,.08); --mat-major: rgba(214,228,245,.2); --mat-text: rgba(214,228,245,.45);
+  --card: #1b2029; --card-head: #212835; --card-line: #333c4b; --ink: #e3e8ef; --ink-dim: #93a0b3;
+  --code-bg: #29313e; --rule: #3a4556; --th-bg: #252d3a; --a: #8ec1f0; --sel: #f0c36a;
+  --shadow: 0 1px 2px rgba(0,0,0,.35), 0 6px 18px rgba(0,0,0,.28);
+}
+:root[data-theme="graphite"] {
+  --void: #08090a; --edge: rgba(0,0,0,.7);
+  --mat: #24272b; --mat-minor: rgba(255,255,255,.05); --mat-major: rgba(255,255,255,.12); --mat-text: rgba(255,255,255,.35);
+  --card: #1c1e21; --card-head: #222529; --card-line: #363a40; --ink: #e2e4e7; --ink-dim: #9097a0;
+  --code-bg: #2a2d32; --rule: #3a3e44; --th-bg: #26292d; --a: #8cc8cc; --sel: #4fa3a9;
+  --shadow: 0 1px 2px rgba(0,0,0,.4), 0 6px 18px rgba(0,0,0,.3);
+}
+:root[data-theme="paper"] {
+  --void: #2a2c2f; --edge: rgba(0,0,0,.25);
+  --mat: #ecebe6; --mat-minor: rgba(40,50,60,.07); --mat-major: rgba(40,50,60,.17); --mat-text: rgba(40,50,60,.45);
+  --card: #ffffff; --card-head: #fbfbfa; --card-line: #d6d4cd; --ink: #1d1f23; --ink-dim: #5d636b;
+  --code-bg: #f2f1ed; --rule: #dddbd4; --th-bg: #f3f2ee; --a: #1f6f8b; --sel: #1f7a80;
+  --shadow: 0 1px 2px rgba(0,0,0,.08), 0 4px 14px rgba(0,0,0,.06);
 }
 
 * { box-sizing: border-box; }
@@ -26,42 +51,46 @@ button, input, select, textarea { font: inherit; color: inherit; }
 [hidden] { display: none !important; }
 
 /* ---- board ------------------------------------------------------------ */
-#viewport { position: fixed; inset: 0; overflow: hidden; overflow: clip; background: var(--void); touch-action: none; }
-#viewport.panning, body.space #viewport { cursor: grab; }
-#viewport.panning { cursor: grabbing; }
+#viewport {
+  position: fixed; inset: 0; overflow: hidden; overflow: clip; touch-action: none; cursor: grab;
+  /* Outside the board: darker, with faint diagonal hatching so it never reads as board. */
+  background: var(--void) repeating-linear-gradient(135deg, rgba(255,255,255,.018) 0 2px, transparent 2px 14px);
+}
+#viewport.panning, #viewport.panning #board { cursor: grabbing; }
 #stage { position: absolute; left: 0; top: 0; transform-origin: 0 0; will-change: transform; }
 #board {
-  position: relative; background-color: var(--board);
-  box-shadow: 0 0 0 1px rgba(255,255,255,.08), 0 10px 60px rgba(0,0,0,.5);
+  position: relative; background-color: var(--mat); cursor: grab;
+  box-shadow: 0 0 0 1px var(--edge), 0 0 0 6px rgba(0,0,0,.25), 0 24px 90px rgba(0,0,0,.6);
 }
 #board.grid {
-  background-image: radial-gradient(circle, rgba(0,0,0,.18) 1px, transparent 1.2px);
+  background-image:
+    linear-gradient(to right, var(--mat-major) 1px, transparent 1px),
+    linear-gradient(to bottom, var(--mat-major) 1px, transparent 1px),
+    linear-gradient(to right, var(--mat-minor) 1px, transparent 1px),
+    linear-gradient(to bottom, var(--mat-minor) 1px, transparent 1px);
+  background-size: var(--major) var(--major), var(--major) var(--major), var(--minor) var(--minor), var(--minor) var(--minor);
 }
-#links, #overlay { position: absolute; left: 0; top: 0; overflow: visible; }
-#links { z-index: 0; }
-#overlay { z-index: 100000; pointer-events: none; }
+#board.grid.coarse { --mat-minor: transparent; }
+#ruler { position: absolute; inset: 0; pointer-events: none; overflow: hidden; font: 10px/1 var(--mono); color: var(--mat-text); }
+#ruler span { position: absolute; white-space: nowrap; }
+#board:not(.grid) #ruler { display: none; }
+#overlay { position: absolute; left: 0; top: 0; overflow: visible; z-index: 100000; pointer-events: none; }
 #cards { position: absolute; inset: 0; pointer-events: none; }
-.card { pointer-events: auto; }
-
-.link-hit { stroke: transparent; stroke-width: 14; fill: none; pointer-events: stroke; cursor: pointer; }
-.link-line { fill: none; stroke-width: 2; pointer-events: none; }
-.link-head { pointer-events: none; }
-.link-label { font: 600 14px var(--font); fill: var(--ink); paint-order: stroke; stroke: var(--board); stroke-width: 5px; stroke-linejoin: round; pointer-events: all; cursor: pointer; }
-.link.sel .link-line { stroke-width: 3.5; }
+.card { pointer-events: auto; cursor: default; }
 
 .card {
   position: absolute; display: flex; flex-direction: column;
   background: var(--card); color: var(--ink);
-  border: 1px solid var(--card-line); border-left: 5px solid var(--cat, #9aa0a6); border-radius: 3px;
-  box-shadow: 0 1px 2px rgba(0,0,0,.08), 0 4px 14px rgba(0,0,0,.06);
+  border: 1px solid var(--card-line); border-left: 5px solid var(--cat, #8a949c); border-radius: 3px;
+  box-shadow: var(--shadow);
 }
 .card.sel { outline: 2px solid var(--sel); outline-offset: 2px; }
 .card.flash { animation: flash .9s ease-out; }
-@keyframes flash { 0% { outline: 6px solid var(--accent); outline-offset: 6px; } 100% { outline: 2px solid transparent; outline-offset: 2px; } }
+@keyframes flash { 0% { outline: 6px solid var(--sel); outline-offset: 6px; } 100% { outline: 2px solid transparent; outline-offset: 2px; } }
 .card.oob { border-style: dashed; border-color: var(--danger); }
 .card-head {
   flex: none; display: flex; align-items: center; gap: 8px; height: 30px; padding: 0 8px 0 9px;
-  border-bottom: 1px solid #ecebe7; cursor: move; user-select: none; background: #fbfbfa;
+  border-bottom: 1px solid var(--card-line); cursor: move; user-select: none; background: var(--card-head);
 }
 .card-head .title { flex: 1; font-weight: 600; font-size: 13px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .card-head .kind { font: 10px var(--mono); color: var(--ink-dim); text-transform: uppercase; letter-spacing: .04em; }
@@ -69,11 +98,12 @@ button, input, select, textarea { font: inherit; color: inherit; }
 .card-body { flex: 1; min-height: 0; overflow: auto; position: relative; }
 .card-body.prose { padding: 10px 14px 14px; font-size: 14px; line-height: 1.5; }
 .card-body.framed { overflow: hidden; }
-.card-body iframe { position: absolute; inset: 0; width: 100%; height: 100%; border: 0; background: #fff; }
+.card-body iframe { position: absolute; inset: 0; width: 100%; height: 100%; border: 0; background: var(--card); }
+.card-body iframe.web { background: #fff; }
 .card-body img { width: 100%; height: 100%; object-fit: contain; display: block; }
-.card-body .ph { position: absolute; inset: 0; display: grid; place-items: center; color: var(--ink-dim); font-size: 13px; background: repeating-linear-gradient(45deg, #f6f5f2 0 10px, #efeee9 10px 20px); }
+.card-body .ph { position: absolute; inset: 0; display: grid; place-items: center; color: var(--ink-dim); font-size: 13px; background: repeating-linear-gradient(45deg, var(--card) 0 10px, var(--card-head) 10px 20px); }
 .card-body .folder-list { margin: 0; padding: 8px 12px; list-style: none; }
-.card-body .folder-list li { padding: 3px 0; border-bottom: 1px solid #f0efeb; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.card-body .folder-list li { padding: 3px 0; border-bottom: 1px solid var(--card-line); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 body.dragging .card-body iframe { pointer-events: none; }
 body.dragging { user-select: none; }
 
@@ -82,26 +112,21 @@ body.dragging { user-select: none; }
 .prose > :first-child { margin-top: 0; }
 .prose p, .prose ul, .prose ol { margin: .4em 0; }
 .prose ul, .prose ol { padding-left: 1.3em; }
-.prose code { font: .88em var(--mono); background: #f2f1ed; padding: .1em .3em; border-radius: 3px; }
-.prose pre { font: 12px/1.45 var(--mono); background: #f5f4f0; padding: 8px 10px; overflow: auto; white-space: pre-wrap; margin: .4em 0; }
+.prose code { font: .88em var(--mono); background: var(--code-bg); padding: .1em .3em; border-radius: 3px; }
+.prose pre { font: 12px/1.45 var(--mono); background: var(--code-bg); padding: 8px 10px; overflow: auto; white-space: pre-wrap; margin: .4em 0; }
 .prose pre code { background: none; padding: 0; }
 .prose table { border-collapse: collapse; font-size: 13px; margin: .4em 0; }
 .card-body.prose table:only-child { width: 100%; }
-.prose th, .prose td { border: 1px solid #dddbd4; padding: 4px 8px; text-align: left; vertical-align: top; }
-.prose th { background: #f3f2ee; font-weight: 600; }
-.prose a { color: #1f6f8b; }
-.prose blockquote { margin: .4em 0; padding-left: .8em; border-left: 3px solid #dddbd4; color: var(--ink-dim); }
+.prose th, .prose td { border: 1px solid var(--rule); padding: 4px 8px; text-align: left; vertical-align: top; }
+.prose th { background: var(--th-bg); font-weight: 600; }
+.prose a { color: var(--a); }
+.prose blockquote { margin: .4em 0; padding-left: .8em; border-left: 3px solid var(--rule); color: var(--ink-dim); }
 
-.link-handle {
-  position: absolute; right: -9px; top: 50%; width: 14px; height: 14px; margin-top: -7px;
-  border-radius: 50%; background: var(--sel); border: 2px solid #fff; cursor: crosshair; opacity: 0; transition: opacity .12s;
-}
-.resize-handle { position: absolute; right: -1px; bottom: -1px; width: 14px; height: 14px; cursor: nwse-resize;
-  background: linear-gradient(135deg, transparent 50%, rgba(0,0,0,.28) 50%, rgba(0,0,0,.28) 60%, transparent 60%, transparent 72%, rgba(0,0,0,.28) 72%, rgba(0,0,0,.28) 82%, transparent 82%); opacity: 0; }
-.card:hover .link-handle, .card.sel .link-handle, .card:hover .resize-handle, .card.sel .resize-handle { opacity: 1; }
-body.linking .card:hover { outline: 2px dashed var(--sel); outline-offset: 3px; }
+.resize-handle { position: absolute; right: -1px; bottom: -1px; width: 14px; height: 14px; cursor: nwse-resize; opacity: 0;
+  background: linear-gradient(135deg, transparent 50%, var(--ink-dim) 50%, var(--ink-dim) 60%, transparent 60%, transparent 72%, var(--ink-dim) 72%, var(--ink-dim) 82%, transparent 82%); }
+.card:hover .resize-handle, .card.sel .resize-handle { opacity: 1; }
 
-.band { fill: rgba(31,122,128,.08); stroke: var(--sel); stroke-width: 1; stroke-dasharray: 4 3; }
+.band { fill: color-mix(in srgb, var(--sel) 10%, transparent); stroke: var(--sel); stroke-width: 1; stroke-dasharray: 4 3; }
 
 /* ---- chrome ----------------------------------------------------------- */
 #hotzone { position: fixed; left: 0; right: 0; top: 0; height: 6px; z-index: 1001; display: none; }

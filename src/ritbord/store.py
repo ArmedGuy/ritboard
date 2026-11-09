@@ -2,8 +2,6 @@
 
 A finding exists in the workspace tree whether or not it is on a board.
 A placement puts a finding on one board at exact pixel coordinates.
-Links belong to a board and connect two findings; they are drawn only
-while both ends are placed on that board.
 """
 
 from __future__ import annotations
@@ -77,15 +75,6 @@ CREATE TABLE IF NOT EXISTS placements (
     w INTEGER NOT NULL, h INTEGER NOT NULL,
     z INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (board_id, finding_id)
-);
-CREATE TABLE IF NOT EXISTS links (
-    id TEXT PRIMARY KEY,
-    board_id TEXT NOT NULL REFERENCES boards(id) ON DELETE CASCADE,
-    from_id TEXT NOT NULL REFERENCES findings(id) ON DELETE CASCADE,
-    to_id TEXT NOT NULL REFERENCES findings(id) ON DELETE CASCADE,
-    label TEXT NOT NULL DEFAULT '',
-    color TEXT,
-    created_at TEXT NOT NULL
 );
 """
 
@@ -524,51 +513,6 @@ class WorkspaceStore:
         self.changed("placements")
         return n
 
-    # ---- links ----------------------------------------------------------
-    def links(self, bid: str | None = None) -> list[dict[str, Any]]:
-        if bid:
-            return [dict(r) for r in self._q("SELECT * FROM links WHERE board_id=? ORDER BY created_at", (bid,))]
-        return [dict(r) for r in self._q("SELECT * FROM links ORDER BY created_at")]
-
-    def add_link(
-        self, bid: str, from_id: str, to_id: str, label: str = "", color: str | None = None
-    ) -> dict[str, Any]:
-        bid = self.get_board_row(bid)["id"]
-        if from_id == to_id:
-            raise ValueError("a link needs two different findings")
-        self.get_finding(from_id)
-        self.get_finding(to_id)
-        existing = self._q(
-            "SELECT * FROM links WHERE board_id=? AND from_id=? AND to_id=?", (bid, from_id, to_id)
-        )
-        if existing:
-            return self.update_link(existing[0]["id"], label=label, color=color) if (label or color) else dict(existing[0])
-        lid = new_id("l")
-        with self._tx() as db:
-            db.execute(
-                "INSERT INTO links(id,board_id,from_id,to_id,label,color,created_at) VALUES(?,?,?,?,?,?,?)",
-                (lid, bid, from_id, to_id, label or "", color, now()),
-            )
-        self.changed("links")
-        return dict(self._q("SELECT * FROM links WHERE id=?", (lid,))[0])
-
-    def update_link(self, lid: str, *, label: str | None = None, color: str | None = None) -> dict[str, Any]:
-        if not self._q("SELECT 1 FROM links WHERE id=?", (lid,)):
-            raise NotFound(f"link {lid} not found")
-        with self._tx() as db:
-            if label is not None:
-                db.execute("UPDATE links SET label=? WHERE id=?", (label, lid))
-            if color is not None:
-                db.execute("UPDATE links SET color=? WHERE id=?", (color or None, lid))
-        self.changed("links")
-        return dict(self._q("SELECT * FROM links WHERE id=?", (lid,))[0])
-
-    def delete_link(self, lid: str) -> None:
-        with self._tx() as db:
-            if not db.execute("DELETE FROM links WHERE id=?", (lid,)).rowcount:
-                raise NotFound(f"link {lid} not found")
-        self.changed("links")
-
     # ---- views ----------------------------------------------------------
     def state(self) -> dict[str, Any]:
         """Everything the UI needs for this workspace."""
@@ -578,11 +522,10 @@ class WorkspaceStore:
             "findings": self.list_findings(),
             "boards": self.list_boards(),
             "placements": self.placements(),
-            "links": self.links(),
         }
 
     def board_view(self, bid: str) -> dict[str, Any]:
-        """A board as an agent sees it: placements with titles, links, bounds problems."""
+        """A board as an agent sees it: placements with titles and bounds problems."""
         board = self.get_board_row(bid)
         titles = {
             r["id"]: (r["title"], r["kind"], r["category"])
@@ -606,15 +549,9 @@ class WorkspaceStore:
                     "out_of_bounds": out,
                 }
             )
-        on_board = {p["finding_id"] for p in placed}
-        links = [
-            {**l, "visible": l["from_id"] in on_board and l["to_id"] in on_board}
-            for l in self.links(board["id"])
-        ]
         return {
             "board": board,
             "placements": placed,
-            "links": links,
             "out_of_bounds": [p["finding_id"] for p in placed if p["out_of_bounds"]],
         }
 

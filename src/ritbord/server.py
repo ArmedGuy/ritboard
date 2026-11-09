@@ -104,13 +104,6 @@ class PlacementItem(BaseModel):
     z: int | None = None
 
 
-class LinkCreate(BaseModel):
-    from_id: str
-    to_id: str
-    label: str = ""
-    color: str | None = None
-
-
 class TokenGate:
     """Optional shared-token check for LAN use. Accepts a Bearer header, a cookie,
     or ?token= (which also sets the cookie so the browser UI keeps working)."""
@@ -284,20 +277,6 @@ def create_app(cfg: Config) -> FastAPI:
     @app.post("/api/w/{ws}/boards/{bid}/unplace")
     async def unplace(ws: str, bid: str, finding_ids: list[str] = Body(...)):
         return {"removed": reg.get(ws).unplace(bid, finding_ids)}
-
-    # ---- links --------------------------------------------------------
-    @app.post("/api/w/{ws}/boards/{bid}/links")
-    async def add_link(ws: str, bid: str, body: LinkCreate):
-        return reg.get(ws).add_link(bid, body.from_id, body.to_id, body.label, body.color)
-
-    @app.patch("/api/w/{ws}/links/{lid}")
-    async def patch_link(ws: str, lid: str, body: dict[str, Any] = Body(...)):
-        return reg.get(ws).update_link(lid, label=body.get("label"), color=body.get("color"))
-
-    @app.delete("/api/w/{ws}/links/{lid}")
-    async def delete_link(ws: str, lid: str):
-        reg.get(ws).delete_link(lid)
-        return {"deleted": lid}
 
     # ---- live updates -------------------------------------------------
     @app.websocket("/ws")

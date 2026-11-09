@@ -71,7 +71,6 @@ const S = {
   data: null,
   boardId: null,
   selected: new Set(),   // finding ids selected on the board
-  selLink: null,
   treeSel: null,
   expanded: new Set(LS.get('expanded', [])),
   sideTab: LS.get('sideTab', 'tree'),
@@ -83,7 +82,7 @@ const S = {
   pendingRefresh: false,
   editing: null,         // finding id, or 'new'
   space: false,
-  disp: Object.assign({ device: true, grid: true, snap: true }, LS.get('display', {})),
+  disp: Object.assign({ device: true, grid: true, snap: true, theme: 'mat' }, LS.get('display', {})),
 };
 
 const by = {
@@ -120,7 +119,7 @@ async function loadWorkspaces() {
 async function selectWorkspace(id) {
   S.ws = id;
   LS.set('ws', id);
-  S.selected.clear(); S.selLink = null; S.treeSel = null;
+  S.selected.clear(); S.treeSel = null;
   closeEditor();
   clearCards();
   sock.subscribe();
@@ -144,7 +143,6 @@ async function loadState() {
       }
       index();
       for (const id of [...S.selected]) if (!S.geom.has(id)) S.selected.delete(id);
-      if (S.selLink && !S.data.links.some((l) => l.id === S.selLink)) S.selLink = null;
       render();
     } finally {
       loading = null;
@@ -160,7 +158,7 @@ function selectBoard(id) {
   saveView();
   S.boardId = id;
   LS.set('board:' + S.ws, id);
-  S.selected.clear(); S.selLink = null;
+  S.selected.clear();
   clearCards();
   loadView();
   index();
@@ -201,9 +199,22 @@ function viewKey() { return `view:${S.ws}:${S.boardId}`; }
 function loadView() { S.view = Object.assign({ zoom: 1, x: 0, y: 0 }, LS.get(viewKey(), {})); }
 let viewSaveTimer;
 function saveView() { clearTimeout(viewSaveTimer); if (S.ws && S.boardId) LS.set(viewKey(), S.view); }
+// How far past each board edge you may pan, in screen pixels.
+const PAN_MARGIN = 160;
+function clampView() {
+  const b = board(); if (!b) return;
+  const vp = $('#viewport').getBoundingClientRect();
+  const k = eff();
+  const clamp = (v, span, size) => Math.min(Math.max(v, Math.min(0, span - size) - PAN_MARGIN), Math.max(0, span - size) + PAN_MARGIN);
+  S.view.x = clamp(S.view.x, vp.width, b.width * k);
+  S.view.y = clamp(S.view.y, vp.height, b.height * k);
+}
 function applyView() {
+  clampView();
   const st = $('#stage');
   st.style.transform = `translate(${S.view.x}px, ${S.view.y}px) scale(${eff()})`;
+  // Drop the fine mat lines when they would be closer than 8 screen pixels.
+  $('#board').classList.toggle('coarse', eff() * matSpacing().minor < 8);
   clearTimeout(viewSaveTimer);
   viewSaveTimer = setTimeout(saveView, 300);
   updateFrames();
@@ -221,13 +232,21 @@ function setZoom(z, cx, cy) {
   S.view.y = cy - by_ * after;
   applyView();
 }
+// The part of the window not covered by the bars.
+function openArea() {
+  const vp = $('#viewport').getBoundingClientRect();
+  const body = document.body.classList;
+  const top = body.contains('chrome-off') ? 0 : $('#topbar').offsetHeight;
+  const left = body.contains('chrome-off') || body.contains('side-off') ? 0 : $('#sidebar').offsetWidth;
+  return { left, top, width: vp.width - left, height: vp.height - top };
+}
 function fitView() {
   const b = board(); if (!b) return;
-  const vp = $('#viewport').getBoundingClientRect();
-  const k = Math.min(vp.width / b.width, vp.height / b.height) * 0.98;
+  const a = openArea();
+  const k = Math.min(a.width / b.width, a.height / b.height) * 0.98;
   S.view.zoom = k / dprFactor();
-  S.view.x = (vp.width - b.width * k) / 2;
-  S.view.y = (vp.height - b.height * k) / 2;
+  S.view.x = a.left + (a.width - b.width * k) / 2;
+  S.view.y = a.top + (a.height - b.height * k) / 2;
   applyView();
 }
 function actualSize() { S.view = { zoom: 1, x: 0, y: 0 }; applyView(); }
@@ -279,15 +298,17 @@ function renderTabs() {
 function renderBoard() {
   const b = board();
   const el = $('#board');
-  if (!b) { el.style.width = el.style.height = '0px'; clearCards(); drawLinks(); return; }
+  if (!b) { el.style.width = el.style.height = '0px'; clearCards(); return; }
   el.style.width = b.width + 'px';
   el.style.height = b.height + 'px';
   el.style.backgroundColor = b.background || '';
-  const g = Math.max(settings().grid || 10, 2) * 5;
+  const { minor, major } = matSpacing();
   el.classList.toggle('grid', !!S.disp.grid);
-  el.style.backgroundSize = `${g}px ${g}px`;
-  el.style.backgroundPosition = `${-g / 2}px ${-g / 2}px`;
-  for (const svg of [$('#links'), $('#overlay')]) { svg.setAttribute('width', b.width); svg.setAttribute('height', b.height); }
+  el.style.setProperty('--minor', minor + 'px');
+  el.style.setProperty('--major', major + 'px');
+  buildRuler(b, major);
+  const ov = $('#overlay');
+  ov.setAttribute('width', b.width); ov.setAttribute('height', b.height);
 
   const seen = new Set();
   for (const [fid, g2] of S.geom) {
@@ -299,8 +320,25 @@ function renderBoard() {
     updateCard(card, f, g2);
   }
   for (const [fid, card] of S.cardEls) if (!seen.has(fid)) { card.remove(); S.cardEls.delete(fid); }
-  drawLinks();
   applyView();
+}
+
+// Cutting-mat lines: minor every 20 px (or the snap grid if coarser), major every 5 minor.
+function matSpacing() {
+  const g = settings().grid || 10;
+  const minor = g >= 20 ? g : 20;
+  return { minor, major: minor * 5 };
+}
+
+let rulerKey = '';
+function buildRuler(b, major) {
+  const key = `${b.width}x${b.height}/${major}`;
+  if (key === rulerKey) return;
+  rulerKey = key;
+  const spans = [];
+  for (let x = major; x < b.width; x += major) spans.push(h('span', { style: { left: x + 3 + 'px', top: '3px' } }, String(x)));
+  for (let y = major; y < b.height; y += major) spans.push(h('span', { style: { left: '3px', top: y + 3 + 'px' } }, String(y)));
+  $('#ruler').replaceChildren(...spans);
 }
 
 function clearCards() { for (const c of S.cardEls.values()) c.remove(); S.cardEls.clear(); }
@@ -309,7 +347,6 @@ function makeCard(fid) {
   return h('div', { class: 'card', 'data-id': fid },
     h('div', { class: 'card-head' }, h('span', { class: 'title' }), h('span', { class: 'src' }), h('span', { class: 'kind' })),
     h('div', { class: 'card-body' }),
-    h('div', { class: 'link-handle', title: 'Drag to another card to link' }),
     h('div', { class: 'resize-handle' }));
 }
 
@@ -359,7 +396,11 @@ function fillBody(body, f) {
 
 function wrapHtml(content) {
   if (/<html|<body|<!doctype/i.test(content)) return content;
-  return '<!doctype html><meta charset="utf-8"><style>body{font:14px/1.5 system-ui,sans-serif;margin:12px;color:#1d1f23}table{border-collapse:collapse}td,th{border:1px solid #ddd;padding:4px 8px}</style>' + content;
+  const css = getComputedStyle(document.documentElement);
+  const v = (n) => css.getPropertyValue(n).trim();
+  return `<!doctype html><meta charset="utf-8"><style>:root{color-scheme:${S.disp.theme === 'paper' ? 'light' : 'dark'}}`
+    + `body{font:14px/1.5 system-ui,sans-serif;margin:12px;color:${v('--ink')};background:${v('--card')}}`
+    + `svg text:not([fill]){fill:currentColor}a{color:${v('--a')}}table{border-collapse:collapse}td,th{border:1px solid ${v('--rule')};padding:4px 8px}</style>` + content;
 }
 
 // Live iframes only when the card is on screen and big enough to read.
@@ -385,7 +426,7 @@ function updateFrames() {
         const frame = f.kind === 'html'
           ? h('iframe', { sandbox: 'allow-scripts allow-popups allow-forms allow-modals', srcdoc: wrapHtml(f.content || ''), loading: 'lazy' })
           : h('iframe', {
-            src: f.content, loading: 'lazy', referrerpolicy: 'no-referrer',
+            class: 'web', src: f.content, loading: 'lazy', referrerpolicy: 'no-referrer',
             sandbox: 'allow-scripts allow-same-origin allow-forms allow-popups allow-popups-to-escape-sandbox allow-presentation',
             allow: 'clipboard-write; fullscreen',
           });
@@ -396,51 +437,6 @@ function updateFrames() {
       }
     }
   });
-}
-
-// ---------------------------------------------------------------- links
-function edgePoint(g, tx, ty, pad = 6) {
-  const cx = g.x + g.w / 2, cy = g.y + g.h / 2;
-  const dx = tx - cx, dy = ty - cy;
-  if (!dx && !dy) return { x: cx, y: cy };
-  const sx = dx ? (g.w / 2 + pad) / Math.abs(dx) : Infinity;
-  const sy = dy ? (g.h / 2 + pad) / Math.abs(dy) : Infinity;
-  const k = Math.min(sx, sy);
-  return { x: cx + dx * k, y: cy + dy * k };
-}
-
-function drawLinks() {
-  const svg = $('#links');
-  svg.replaceChildren();
-  if (!S.data || !board()) return;
-  for (const l of S.data.links) {
-    if (l.board_id !== S.boardId) continue;
-    const a = S.geom.get(l.from_id), b = S.geom.get(l.to_id);
-    if (!a || !b) continue;
-    const ac = { x: a.x + a.w / 2, y: a.y + a.h / 2 }, bc = { x: b.x + b.w / 2, y: b.y + b.h / 2 };
-    const p1 = edgePoint(a, bc.x, bc.y), p2 = edgePoint(b, ac.x, ac.y);
-    const color = l.color || getComputedStyle(document.documentElement).getPropertyValue('--link').trim();
-    const sel = S.selLink === l.id;
-    const g = s('g', { class: 'link' + (sel ? ' sel' : ''), 'data-link': l.id });
-    const stroke = sel ? 'var(--sel)' : color;
-    const ang = Math.atan2(p2.y - p1.y, p2.x - p1.x), L = 13, Wd = 6;
-    const bx = p2.x - Math.cos(ang) * L, by_ = p2.y - Math.sin(ang) * L;
-    g.append(
-      s('line', { class: 'link-hit', x1: p1.x, y1: p1.y, x2: p2.x, y2: p2.y }),
-      s('line', { class: 'link-line', x1: p1.x, y1: p1.y, x2: bx, y2: by_, stroke }),
-      s('polygon', {
-        class: 'link-head', fill: stroke,
-        points: `${p2.x},${p2.y} ${bx - Math.sin(ang) * Wd},${by_ + Math.cos(ang) * Wd} ${bx + Math.sin(ang) * Wd},${by_ - Math.cos(ang) * Wd}`,
-      }),
-    );
-    if (l.label) {
-      const t = s('text', { class: 'link-label', x: (p1.x + p2.x) / 2, y: (p1.y + p2.y) / 2, 'text-anchor': 'middle', 'dominant-baseline': 'middle' });
-      t.style.setProperty('stroke', board().background || 'var(--board)');
-      t.textContent = l.label;
-      g.append(t);
-    }
-    svg.append(g);
-  }
 }
 
 // ---------------------------------------------------------------- sidebar
@@ -555,7 +551,6 @@ function treeClick(id) {
   S.treeSel = id;
   if (S.geom.has(id)) {
     S.selected = new Set([id]);
-    S.selLink = null;
     const card = S.cardEls.get(id);
     if (card) { card.classList.remove('flash'); void card.offsetWidth; card.classList.add('flash'); }
   }
@@ -576,7 +571,6 @@ async function pullIn(ids) {
 
 function renderBoardSelection() {
   for (const [id, card] of S.cardEls) card.classList.toggle('sel', S.selected.has(id));
-  drawLinks();
 }
 
 function renderStatus() {
@@ -598,7 +592,7 @@ function cardAt(clientX, clientY) {
   return el?.closest?.('.card');
 }
 
-function setSelected(ids) { S.selected = new Set(ids); S.selLink = null; renderBoardSelection(); renderStatus(); }
+function setSelected(ids) { S.selected = new Set(ids); renderBoardSelection(); renderStatus(); }
 
 function bringToFront(ids) {
   let z = Math.max(0, ...[...S.geom.values()].map((g) => g.z));
@@ -627,21 +621,11 @@ function onPointerDown(e) {
   const fid = card?.dataset.id;
   const pt = toBoard(e.clientX, e.clientY);
 
-  if (t.closest('.link-hit, .link-label')) {
-    const lid = t.closest('.link').dataset.link;
-    S.selLink = lid; S.selected.clear();
-    renderBoardSelection(); renderStatus();
-    return;
-  }
   if (card && t.classList.contains('resize-handle')) {
     e.preventDefault();
     const g = S.geom.get(fid);
     S.drag = { mode: 'resize', ids: [fid], sx: pt.x, sy: pt.y, g0: { ...g } };
     if (!S.selected.has(fid)) setSelected([fid]);
-  } else if (card && t.classList.contains('link-handle')) {
-    e.preventDefault();
-    S.drag = { mode: 'link', from: fid };
-    document.body.classList.add('linking');
   } else if (card && t.closest('.card-head')) {
     e.preventDefault();
     if (e.shiftKey || e.ctrlKey || e.metaKey) {
@@ -657,9 +641,13 @@ function onPointerDown(e) {
     S.treeSel = fid;
     renderSidebar();
     return;
+  } else if (e.shiftKey || e.ctrlKey || e.metaKey) {
+    // Shift/Ctrl-drag on empty space: rubber-band select.
+    S.drag = { mode: 'band', sx: pt.x, sy: pt.y, add: true, base: new Set(S.selected) };
   } else {
-    // Empty space: rubber-band select.
-    S.drag = { mode: 'band', sx: pt.x, sy: pt.y, add: e.shiftKey, base: new Set(S.selected) };
+    // Plain drag on empty space pans; a plain click clears the selection.
+    S.drag = { mode: 'pan', sx: e.clientX, sy: e.clientY, vx: S.view.x, vy: S.view.y, click: true };
+    vp.classList.add('panning');
   }
   document.body.classList.add('dragging');
   vp.setPointerCapture(e.pointerId);
@@ -689,7 +677,7 @@ function onPointerMove(e) {
       c.style.left = g.x + 'px'; c.style.top = g.y + 'px';
       c.classList.toggle('oob', !!isOOB(g));
     }
-    drawLinks(); renderStatus();
+    renderStatus();
   } else if (d.mode === 'resize') {
     const id = d.ids[0], g = S.geom.get(id), g0 = d.g0;
     g.w = Math.max(40, snap(g0.x + g0.w + pt.x - d.sx, e) - g0.x);
@@ -698,11 +686,7 @@ function onPointerMove(e) {
     c.style.width = g.w + 'px'; c.style.height = g.h + 'px';
     c.classList.toggle('oob', !!isOOB(g));
     d.moved = true;
-    drawLinks(); renderStatus();
-  } else if (d.mode === 'link') {
-    const a = S.geom.get(d.from);
-    const p = edgePoint(a, pt.x, pt.y, 0);
-    ov.replaceChildren(s('line', { x1: p.x, y1: p.y, x2: pt.x, y2: pt.y, stroke: 'var(--sel)', 'stroke-width': 2 / eff(), 'stroke-dasharray': `${6 / eff()} ${4 / eff()}` }));
+    renderStatus();
   } else if (d.mode === 'band') {
     const x = Math.min(d.sx, pt.x), y = Math.min(d.sy, pt.y), w = Math.abs(pt.x - d.sx), hh = Math.abs(pt.y - d.sy);
     d.rect = { x, y, w, h: hh };
@@ -719,23 +703,20 @@ async function onPointerUp(e) {
   if (!d) return;
   const vp = $('#viewport');
   vp.classList.remove('panning');
-  document.body.classList.remove('dragging', 'linking');
+  document.body.classList.remove('dragging');
   $('#overlay').replaceChildren();
   try { vp.releasePointerCapture(e.pointerId); } catch { /* not captured */ }
   try {
-    if (d.mode === 'move' && d.moved) {
+    if (d.mode === 'pan' && d.click && Math.hypot(e.clientX - d.sx, e.clientY - d.sy) < 3) {
+      setSelected([]);
+    } else if (d.mode === 'move' && d.moved) {
       bringToFront(d.ids);
       for (const id of d.ids) S.cardEls.get(id).style.zIndex = 1 + S.geom.get(id).z;
       await savePlacements(d.ids);
     } else if (d.mode === 'resize' && d.moved) {
       await savePlacements(d.ids);
-    } else if (d.mode === 'link') {
-      const target = cardAt(e.clientX, e.clientY);
-      if (target && target.dataset.id !== d.from) {
-        await api.post(`${W()}/boards/${S.boardId}/links`, { from_id: d.from, to_id: target.dataset.id });
-      }
     } else if (d.mode === 'band') {
-      if (!d.rect || d.rect.w * eff() < 3) { if (!d.add) setSelected([]); S.selLink = null; drawLinks(); }
+      if (!d.rect || d.rect.w * eff() < 3) { if (!d.add) setSelected([]); }
       renderStatus();
     }
   } finally {
@@ -771,13 +752,6 @@ function onDrop(e) {
   api.put(`${W()}/boards/${S.boardId}/placements`, [item]).then(() => { S.selected = new Set([id]); });
 }
 
-async function editLinkLabel(lid) {
-  const l = S.data.links.find((x) => x.id === lid);
-  if (!l) return;
-  const label = prompt('Link label', l.label || '');
-  if (label != null) await api.patch(`${W()}/links/${lid}`, { label });
-}
-
 let nudgeTimer;
 function nudge(dx, dy) {
   const ids = [...S.selected];
@@ -788,7 +762,7 @@ function nudge(dx, dy) {
     c.style.left = g.x + 'px'; c.style.top = g.y + 'px';
     c.classList.toggle('oob', !!isOOB(g));
   }
-  drawLinks(); renderStatus();
+  renderStatus();
   clearTimeout(nudgeTimer);
   nudgeTimer = setTimeout(() => savePlacements(ids), 250);
 }
@@ -803,14 +777,13 @@ function onKey(e) {
   const step = e.shiftKey ? (settings().grid || 10) : 1;
   switch (e.key) {
     case 'Delete': case 'Backspace':
-      if (S.selLink) { api.del(`${W()}/links/${S.selLink}`); S.selLink = null; }
-      else if (S.selected.size) api.post(`${W()}/boards/${S.boardId}/unplace`, [...S.selected]);
+      if (S.selected.size) api.post(`${W()}/boards/${S.boardId}/unplace`, [...S.selected]);
       e.preventDefault(); break;
     case 'ArrowLeft': if (S.selected.size) { nudge(-step, 0); e.preventDefault(); } break;
     case 'ArrowRight': if (S.selected.size) { nudge(step, 0); e.preventDefault(); } break;
     case 'ArrowUp': if (S.selected.size) { nudge(0, -step); e.preventDefault(); } break;
     case 'ArrowDown': if (S.selected.size) { nudge(0, step); e.preventDefault(); } break;
-    case 'Escape': setSelected([]); drawLinks(); closeEditor(); break;
+    case 'Escape': setSelected([]); closeEditor(); break;
     case 'Enter': if (S.selected.size === 1) openEditor([...S.selected][0]); break;
     case '\\': toggleSidebar(); break;
     case 'h': case 'H': toggleChrome(); break;
@@ -894,6 +867,12 @@ async function saveEditor(e) {
 }
 
 // ---------------------------------------------------------------- settings
+function themeMat() {
+  // The theme's mat colour as #rrggbb for the colour input.
+  const c = getComputedStyle(document.documentElement).getPropertyValue('--mat').trim();
+  return /^#[0-9a-f]{6}$/i.test(c) ? c : '#1f3d32';
+}
+
 const PRESETS = [[1920, 1080], [2560, 1440], [3840, 2160], [5120, 2880], [7680, 2160], [7680, 4320], [11520, 2160]];
 
 async function openSettings() {
@@ -903,7 +882,7 @@ async function openSettings() {
   f.b_name.value = b?.name || '';
   f.b_w.value = b?.width || '';
   f.b_h.value = b?.height || '';
-  f.b_bg.value = b?.background || '#ecebe6';
+  f.b_bg.value = b?.background || themeMat();
   $('#presets').replaceChildren(...PRESETS.map(([w, hh]) => h('button', { type: 'button', onclick: () => { f.b_w.value = w; f.b_h.value = hh; } }, `${w}×${hh}`)),
     h('button', { type: 'button', title: 'This window in device pixels', onclick: () => { f.b_w.value = Math.round(innerWidth * devicePixelRatio); f.b_h.value = Math.round(innerHeight * devicePixelRatio); } }, 'This screen'));
   f.w_name.value = ws?.name || '';
@@ -912,6 +891,7 @@ async function openSettings() {
   f.w_bh.value = st.board_height;
   $('#set-cats').replaceChildren(...Object.entries(st.categories).map(([name, color]) =>
     h('label', {}, h('input', { type: 'color', value: color, 'data-cat': name }), name)));
+  f.d_theme.value = S.disp.theme;
   f.d_device.checked = S.disp.device;
   f.d_grid.checked = S.disp.grid;
   f.d_snap.checked = S.disp.snap;
@@ -927,7 +907,7 @@ function wireSettings() {
   const f = $('#set-form');
   $('#set-board-apply').onclick = async () => {
     const b = board(); if (!b) return;
-    await api.patch(`${W()}/boards/${b.id}`, { name: f.b_name.value.trim() || b.name, width: +f.b_w.value, height: +f.b_h.value, background: f.b_bg.value === '#ecebe6' ? null : f.b_bg.value });
+    await api.patch(`${W()}/boards/${b.id}`, { name: f.b_name.value.trim() || b.name, width: +f.b_w.value, height: +f.b_h.value, background: f.b_bg.value === themeMat() ? (b.background || null) : f.b_bg.value });
     $('#settings').close();
   };
   $('#set-board-delete').onclick = async () => {
@@ -954,10 +934,13 @@ function wireSettings() {
     await loadWorkspaces();
     if (S.workspaces[0]) await selectWorkspace(S.workspaces[0].id);
   };
-  for (const k of ['d_device', 'd_grid', 'd_snap']) {
+  for (const k of ['d_theme', 'd_device', 'd_grid', 'd_snap']) {
     f[k].onchange = () => {
-      S.disp = { device: f.d_device.checked, grid: f.d_grid.checked, snap: f.d_snap.checked };
+      const themeChanged = f.d_theme.value !== S.disp.theme;
+      S.disp = { theme: f.d_theme.value, device: f.d_device.checked, grid: f.d_grid.checked, snap: f.d_snap.checked };
       LS.set('display', S.disp);
+      applyTheme();
+      if (themeChanged) for (const c of S.cardEls.values()) delete c.dataset.ver;  // rebuild framed HTML in new colors
       renderBoard();
     };
   }
@@ -982,8 +965,6 @@ function wire() {
   vp.addEventListener('dblclick', (e) => {
     // Pointer capture can retarget click events to the viewport, so look up what is under the pointer.
     const t = document.elementFromPoint(e.clientX, e.clientY) || e.target;
-    const link = t.closest('.link');
-    if (link) return editLinkLabel(link.dataset.link);
     const card = t.closest('.card');
     if (card && t.closest('.card-head')) openEditor(card.dataset.id);
   });
@@ -1063,7 +1044,10 @@ function wire() {
   wireSettings();
 }
 
+function applyTheme() { document.documentElement.dataset.theme = S.disp.theme || 'mat'; }
+
 async function main() {
+  applyTheme();
   if (LS.get('sideOff', false)) document.body.classList.add('side-off');
   if (LS.get('chromeOff', false)) document.body.classList.add('chrome-off');
   wire();
