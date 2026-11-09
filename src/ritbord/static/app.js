@@ -345,9 +345,18 @@ function clearCards() { for (const c of S.cardEls.values()) c.remove(); S.cardEl
 
 function makeCard(fid) {
   return h('div', { class: 'card', 'data-id': fid },
-    h('div', { class: 'card-head' }, h('span', { class: 'title' }), h('span', { class: 'src' }), h('span', { class: 'kind' })),
+    h('div', { class: 'card-head' }, h('span', { class: 'title' }), h('span', { class: 'src' }), h('span', { class: 'kind' }),
+      h('a', { class: 'open', target: '_blank', rel: 'noopener noreferrer', title: 'Open in a new window', hidden: true }, '↗')),
     h('div', { class: 'card-body' }),
     h('div', { class: 'resize-handle' }));
+}
+
+// Sites known to refuse being shown inside another page. Their cards get a button instead.
+function refusesFraming(url) {
+  try {
+    const u = new URL(url);
+    return /(^|\.)claude\.ai$/i.test(u.hostname);
+  } catch { return false; }
 }
 
 const KIND_LABEL = { md: 'md', text: 'txt', csv: 'table', html: 'html', url: 'web', image: 'img', folder: 'folder' };
@@ -362,6 +371,9 @@ function updateCard(card, f, g) {
   $('.title', card).textContent = f.title;
   $('.kind', card).textContent = KIND_LABEL[f.kind] || f.kind;
   $('.src', card).textContent = f.source || '';
+  const open = $('a.open', card);
+  open.hidden = f.kind !== 'url' || !/^https?:/i.test(f.content || '');
+  if (!open.hidden) open.href = f.content;
   card.title = [f.category && `Category: ${f.category}`, f.tags?.length && `Tags: ${f.tags.join(', ')}`].filter(Boolean).join('\n');
   const ver = f.kind === 'folder'
     ? f.updated_at + '|' + (by.children.get(f.id) || []).map((c) => c.id + c.title).join(',')
@@ -376,6 +388,7 @@ function fillBody(body, f) {
   body.className = 'card-body';
   body.replaceChildren();
   delete body.dataset.loaded;
+  delete body.dataset.noframe;
   if (f.kind === 'md' || f.kind === 'text' || f.kind === 'csv') {
     body.classList.add('prose');
     body.innerHTML = f.rendered || '';
@@ -387,6 +400,13 @@ function fillBody(body, f) {
     body.append(kids.length
       ? h('ul', { class: 'folder-list' }, kids.map((k) => h('li', {}, k.title)))
       : h('div', { class: 'ph' }, 'Empty folder'));
+  } else if (f.kind === 'url' && refusesFraming(f.content)) {
+    body.classList.add('framed');
+    body.dataset.noframe = '1';
+    body.append(h('div', { class: 'ph noframe' },
+      h('div', {}, 'claude.ai won’t show its pages inside another site.'),
+      h('a', { href: f.content, target: '_blank', rel: 'noopener noreferrer' }, 'Open in a new window ↗'),
+      h('small', {}, 'To show an artifact here, post its HTML as an html card.')));
   } else {
     body.classList.add('framed');
     body.append(h('div', { class: 'ph' }, f.kind === 'url' ? (f.content || 'No URL') : 'HTML'));
@@ -419,6 +439,7 @@ function updateFrames() {
       const g = S.geom.get(fid);
       if (!g) continue;
       const body = $('.card-body', card);
+      if (body.dataset.noframe) continue;
       const visible = g.x < v1.x && g.x + g.w > v0.x && g.y < v1.y && g.y + g.h > v0.y;
       const readable = k * Math.min(g.w, g.h) > 80;
       if (visible && readable && !body.dataset.loaded) {
@@ -617,6 +638,7 @@ function onPointerDown(e) {
     return;
   }
   if (e.button !== 0) return;
+  if (t.closest('a[href]')) return;  // let links work; don't start a drag
   const card = t.closest('.card');
   const fid = card?.dataset.id;
   const pt = toBoard(e.clientX, e.clientY);
