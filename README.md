@@ -61,8 +61,10 @@ Run `uv run python scripts/add_to_claude_desktop.py` to add it, or add it to
 }
 ```
 
-If the app can't find `uv`, give its full path (`where uv` shows it). The tools list even
-when the server is down; calls then return a message saying to start it.
+If the app can't find `uv`, give its full path (`where uv` shows it). The bridge takes its
+tool list from the running server, so after updating Ritboard only the server needs a
+restart: the bridge tells the app the tools changed. When the server is down the tools
+still list; calls then return a message saying to start it.
 
 claude.ai on the web can't reach a server on your machine. That needs an HTTPS tunnel
 and `--token`.

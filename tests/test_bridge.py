@@ -45,3 +45,14 @@ def test_bridge_finds_server_via_beacon(server, tmp_path_factory):  # noqa: F811
             assert res["workspaces"]
 
     asyncio.run(run())
+
+
+def test_bridge_lists_the_servers_tools(server):  # noqa: F811
+    async def run():
+        async with Client(server + "/mcp") as direct:
+            want = sorted(t.name for t in (await direct.list_tools()).tools)
+        async with Client(_bridge(server)) as c:
+            got = sorted(t.name for t in (await c.list_tools()).tools)
+        assert got == want
+
+    asyncio.run(run())
