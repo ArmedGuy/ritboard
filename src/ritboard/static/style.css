@@ -9,7 +9,7 @@
   --danger: #e2566b;
   --font: system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", sans-serif;
   --mono: ui-monospace, "Cascadia Mono", "SF Mono", Menlo, Consolas, monospace;
-  --bar-h: 40px;
+  --bar-h: 56px;
 }
 
 /* ---- themes -----------------------------------------------------------
@@ -131,7 +131,7 @@ body.dragging { user-select: none; }
 body.chrome-off #hotzone { display: block; }
 #topbar {
   position: fixed; left: 0; right: 0; top: 0; height: var(--bar-h); z-index: 1000;
-  display: flex; align-items: center; gap: 6px; padding: 0 8px;
+  display: flex; align-items: center; gap: 8px; padding: 0 10px;
   background: var(--chrome); border-bottom: 1px solid var(--chrome-line); backdrop-filter: blur(6px);
   transition: transform .15s ease;
 }
@@ -140,19 +140,21 @@ body.chrome-off #sidebar { transform: translateX(-110%); }
 body.chrome-off #status { transform: translateY(150%); }
 body.chrome-off #hotzone:hover + #topbar, body.chrome-off #topbar:hover { transform: none; }
 .spacer { flex: 1; }
-button.icon, button.text { background: none; border: 1px solid transparent; border-radius: 4px; color: var(--chrome-text); cursor: pointer; height: 28px; }
-button.icon { width: 30px; font-size: 15px; }
+button.icon, button.text { background: none; border: 1px solid transparent; border-radius: 5px; color: var(--chrome-text); cursor: pointer; height: 42px; }
+button.icon { width: 44px; font-size: 19px; }
+button.text { font-size: 15px; padding: 0 12px; }
 button.text { padding: 0 8px; }
 button.icon:hover, button.text:hover { background: var(--chrome-3); }
-select#ws-select { background: var(--chrome-2); border: 1px solid var(--chrome-line); border-radius: 4px; height: 28px; padding: 0 6px; max-width: 220px; font-weight: 600; }
-#tabs { display: flex; gap: 2px; overflow-x: auto; min-width: 0; scrollbar-width: none; }
+select#ws-select { background: var(--chrome-2); border: 1px solid var(--chrome-line); border-radius: 5px; height: 42px; padding: 0 10px; max-width: 260px; font-weight: 600; font-size: 15px; }
+#tabs { display: flex; align-self: stretch; align-items: flex-end; gap: 4px; overflow-x: auto; min-width: 0; scrollbar-width: none; margin-left: 8px; }
 #tabs button {
-  background: none; border: 1px solid transparent; border-radius: 4px; height: 28px; padding: 0 10px; cursor: pointer;
+  background: none; border: 1px solid transparent; border-bottom: 3px solid transparent; border-radius: 5px 5px 0 0;
+  height: 46px; padding: 0 20px; cursor: pointer; font-size: 15px; font-weight: 500;
   color: var(--chrome-dim); white-space: nowrap;
 }
 #tabs button:hover { color: var(--chrome-text); background: var(--chrome-2); }
-#tabs button.on { color: var(--chrome-text); background: var(--chrome-3); border-color: var(--chrome-line); }
-#tabs button small { color: var(--chrome-dim); font-size: 10px; margin-left: 6px; font-family: var(--mono); }
+#tabs button.on { color: var(--chrome-text); background: var(--chrome-2); border-color: var(--chrome-line) var(--chrome-line) var(--accent); }
+#tabs button small { color: var(--chrome-dim); font-size: 11px; margin-left: 8px; font-family: var(--mono); }
 #conn { width: 8px; height: 8px; border-radius: 50%; background: var(--danger); margin: 0 6px; }
 #conn.on { background: #6a994e; }
 
