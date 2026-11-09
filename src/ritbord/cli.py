@@ -158,6 +158,25 @@ def cmd_app(args) -> None:
     webview.start(private_mode=False)
 
 
+def cmd_mcp(args) -> None:
+    import asyncio
+    import json
+
+    from .stdio_bridge import run_bridge
+
+    url, token = args.url, args.token
+
+    def locate():
+        # A running server leaves its address in <data>/server.json.
+        try:
+            info = json.loads((args.data / "server.json").read_text())
+            return info["url"], info.get("token")
+        except (OSError, ValueError, KeyError):
+            return f"http://127.0.0.1:{os.environ.get('RITBORD_PORT', 8765)}", None
+
+    asyncio.run(run_bridge(url, token, locate=None if url else locate))
+
+
 def main(argv: list[str] | None = None) -> None:
     ap = argparse.ArgumentParser(prog="ritbord", description="Big-screen planning board with an MCP endpoint")
     sub = ap.add_subparsers(dest="cmd")
@@ -176,8 +195,18 @@ def main(argv: list[str] | None = None) -> None:
     a.add_argument("--height", type=int, default=1000)
     a.set_defaults(func=cmd_app)
 
+    m = sub.add_parser("mcp", help="stdio MCP server that forwards to a running Ritbord (for Claude Desktop)")
+    m.add_argument(
+        "--url",
+        default=os.environ.get("RITBORD_URL"),
+        help="address of the running server (default: found via <data>/server.json)",
+    )
+    m.add_argument("--token", default=os.environ.get("RITBORD_TOKEN"))
+    m.add_argument("--data", type=Path, default=default_data_dir(), help="data folder of the server to find")
+    m.set_defaults(func=cmd_mcp)
+
     argv = list(sys.argv[1:] if argv is None else argv)
-    if not argv or argv[0] not in ("serve", "app", "-h", "--help"):
+    if not argv or argv[0] not in ("serve", "app", "mcp", "-h", "--help"):
         argv.insert(0, "serve")
     args = ap.parse_args(argv)
     args.func(args)

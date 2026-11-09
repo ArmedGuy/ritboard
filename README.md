@@ -42,7 +42,27 @@ Tools: `list_workspaces`, `current_workspace`, `create_workspace`, `update_works
 `update_finding`, `delete_finding`, `create_board`, `update_board`, `delete_board`,
 `get_board`, `place_findings`, `remove_from_board`.
 
-claude.ai can't reach a server on your LAN. To connect it there you need an HTTPS tunnel
+Claude Desktop only starts MCP servers as local commands (stdio). `ritbord mcp` is that
+command: it forwards every call to the running Ritbord over its local HTTP socket, so there
+is still one server and live updates still reach the board. It finds the server through
+`<data>/server.json`, which `ritbord serve` writes on start, so no port goes in the config.
+Add to `%APPDATA%\Claude\claude_desktop_config.json` and restart the app:
+
+```json
+{
+  "mcpServers": {
+    "ritbord": {
+      "command": "uv",
+      "args": ["--directory", "C:\\Users\\johan\\Projects\\ritbord", "run", "ritbord", "mcp"]
+    }
+  }
+}
+```
+
+If the app can't find `uv`, give its full path (`where uv` shows it). The tools list even
+when the server is down; calls then return a message saying to start it.
+
+claude.ai on the web can't reach a server on your machine. That needs an HTTPS tunnel
 and `--token`.
 
 ## Model

@@ -52,6 +52,20 @@ async def _watch_static(hub: Hub) -> None:
             await hub.broadcast_all({"type": "reload"})
 
 
+def _write_beacon(cfg: Config) -> Path:
+    """Leave the running server's address in the data folder so `ritbord mcp` finds it
+    without being told the port."""
+    import os
+
+    host = "127.0.0.1" if cfg.host in ("0.0.0.0", "", "::") else cfg.host
+    if ":" in host:
+        host = f"[{host}]"
+    path = Path(cfg.data_dir) / "server.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({"url": f"http://{host}:{cfg.port}", "pid": os.getpid(), "token": cfg.token}))
+    return path
+
+
 def app_from_env():
     """Factory for `uvicorn --reload`, which cannot pass arguments."""
     import os
@@ -182,11 +196,16 @@ def create_app(cfg: Config) -> FastAPI:
     async def lifespan(app: FastAPI):
         hub.loop = asyncio.get_running_loop()
         watcher = asyncio.create_task(_watch_static(hub)) if cfg.dev else None
-        async with mcp.session_manager.run():
-            yield
-        if watcher:
-            watcher.cancel()
-        reg.close()
+        beacon = _write_beacon(cfg)
+        try:
+            async with mcp.session_manager.run():
+                yield
+        finally:
+            if watcher:
+                watcher.cancel()
+            with contextlib.suppress(OSError):
+                beacon.unlink()
+            reg.close()
 
     app = FastAPI(title="Ritbord", version=__version__, lifespan=lifespan, docs_url="/api/docs", openapi_url="/api/openapi.json")
     app.state.registry = reg
