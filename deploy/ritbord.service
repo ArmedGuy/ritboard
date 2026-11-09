@@ -1,0 +1,13 @@
+[Unit]
+Description=Ritbord planning board
+After=network-online.target
+
+[Service]
+# Installed with `uv tool install .`; adjust the path if uv puts tools elsewhere.
+ExecStart=%h/.local/bin/ritbord serve --host 127.0.0.1 --port 8765
+Restart=on-failure
+# Environment=RITBORD_TOKEN=change-me
+# Environment=RITBORD_DATA=%h/ritbord-data
+
+[Install]
+WantedBy=default.target

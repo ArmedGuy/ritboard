@@ -1,0 +1,1079 @@
+// Ritbord UI. No build step, no dependencies.
+'use strict';
+
+const $ = (s, el = document) => el.querySelector(s);
+const $$ = (s, el = document) => [...el.querySelectorAll(s)];
+const SVGNS = 'http://www.w3.org/2000/svg';
+
+function h(tag, attrs = {}, ...kids) {
+  const el = document.createElement(tag);
+  for (const [k, v] of Object.entries(attrs || {})) {
+    if (v == null || v === false) continue;
+    if (k === 'class') el.className = v;
+    else if (k === 'style' && typeof v === 'object') Object.assign(el.style, v);
+    else if (k.startsWith('on')) el.addEventListener(k.slice(2), v);
+    else if (k in el && typeof v !== 'string') el[k] = v;
+    else el.setAttribute(k, v === true ? '' : v);
+  }
+  for (const kid of kids.flat()) if (kid != null && kid !== false) el.append(kid);
+  return el;
+}
+function s(tag, attrs = {}) {
+  const el = document.createElementNS(SVGNS, tag);
+  for (const [k, v] of Object.entries(attrs)) if (v != null) el.setAttribute(k, v);
+  return el;
+}
+
+const LS = {
+  get(k, d) { try { const v = localStorage.getItem('ritbord:' + k); return v == null ? d : JSON.parse(v); } catch { return d; } },
+  set(k, v) { try { localStorage.setItem('ritbord:' + k, JSON.stringify(v)); } catch { /* storage off */ } },
+};
+
+// ---------------------------------------------------------------- api
+async function req(method, path, body) {
+  const res = await fetch(path, {
+    method,
+    headers: body !== undefined ? { 'Content-Type': 'application/json' } : {},
+    body: body !== undefined ? JSON.stringify(body) : undefined,
+    credentials: 'same-origin',
+  });
+  const text = await res.text();
+  const data = text ? JSON.parse(text) : null;
+  if (!res.ok) {
+    const msg = (data && data.detail) ? (typeof data.detail === 'string' ? data.detail : JSON.stringify(data.detail)) : res.statusText;
+    toast(msg);
+    throw new Error(msg);
+  }
+  return data;
+}
+const api = {
+  get: (p) => req('GET', p),
+  post: (p, b) => req('POST', p, b ?? {}),
+  patch: (p, b) => req('PATCH', p, b),
+  put: (p, b) => req('PUT', p, b),
+  del: (p) => req('DELETE', p),
+};
+const W = () => `/api/w/${encodeURIComponent(S.ws)}`;
+
+let toastTimer;
+function toast(msg) {
+  const t = $('#toast');
+  t.textContent = msg;
+  t.hidden = false;
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => (t.hidden = true), 4000);
+}
+
+// ---------------------------------------------------------------- state
+const S = {
+  workspaces: [],
+  ws: null,
+  data: null,
+  boardId: null,
+  selected: new Set(),   // finding ids selected on the board
+  selLink: null,
+  treeSel: null,
+  expanded: new Set(LS.get('expanded', [])),
+  sideTab: LS.get('sideTab', 'tree'),
+  filter: '',
+  view: { zoom: 1, x: 0, y: 0 },
+  geom: new Map(),       // finding id -> {x,y,w,h,z} for the current board
+  cardEls: new Map(),
+  drag: null,
+  pendingRefresh: false,
+  editing: null,         // finding id, or 'new'
+  space: false,
+  disp: Object.assign({ device: true, grid: true, snap: true }, LS.get('display', {})),
+};
+
+const by = {
+  finding: new Map(),
+  children: new Map(),
+};
+
+function board() { return S.data?.boards.find((b) => b.id === S.boardId) || null; }
+function settings() { return S.data?.settings || { grid: 10, categories: {} }; }
+function catColor(cat) { return (cat && settings().categories[cat]) || '#9aa0a6'; }
+function dprFactor() { return S.disp.device ? 1 / (window.devicePixelRatio || 1) : 1; }
+function eff() { return S.view.zoom * dprFactor(); }
+function isOOB(g, b = board()) { return b && (g.x < 0 || g.y < 0 || g.x + g.w > b.width || g.y + g.h > b.height); }
+
+function index() {
+  by.finding.clear();
+  by.children.clear();
+  for (const f of S.data.findings) {
+    by.finding.set(f.id, f);
+    const k = f.parent_id || '';
+    if (!by.children.has(k)) by.children.set(k, []);
+    by.children.get(k).push(f);
+  }
+  S.geom.clear();
+  for (const p of S.data.placements) if (p.board_id === S.boardId) S.geom.set(p.finding_id, { x: p.x, y: p.y, w: p.w, h: p.h, z: p.z });
+}
+
+// ---------------------------------------------------------------- loading
+async function loadWorkspaces() {
+  S.workspaces = await api.get('/api/workspaces');
+  renderWsSelect();
+}
+
+async function selectWorkspace(id) {
+  S.ws = id;
+  LS.set('ws', id);
+  S.selected.clear(); S.selLink = null; S.treeSel = null;
+  closeEditor();
+  clearCards();
+  sock.subscribe();
+  await loadState();
+}
+
+let loading = null;
+async function loadState() {
+  if (!S.ws) return;
+  if (S.drag) { S.pendingRefresh = true; return; }
+  if (loading) { S.pendingRefresh = true; return; }
+  loading = (async () => {
+    try {
+      const data = await api.get(`${W()}/state`);
+      if (data.workspace.id !== S.ws) return;
+      S.data = data;
+      if (!S.data.boards.some((b) => b.id === S.boardId)) {
+        const remembered = LS.get('board:' + S.ws);
+        S.boardId = S.data.boards.some((b) => b.id === remembered) ? remembered : S.data.boards[0]?.id || null;
+        loadView();
+      }
+      index();
+      for (const id of [...S.selected]) if (!S.geom.has(id)) S.selected.delete(id);
+      if (S.selLink && !S.data.links.some((l) => l.id === S.selLink)) S.selLink = null;
+      render();
+    } finally {
+      loading = null;
+      if (S.pendingRefresh && !S.drag) { S.pendingRefresh = false; loadState(); }
+    }
+  })();
+  return loading;
+}
+let refreshTimer;
+function scheduleRefresh() { clearTimeout(refreshTimer); refreshTimer = setTimeout(loadState, 40); }
+
+function selectBoard(id) {
+  saveView();
+  S.boardId = id;
+  LS.set('board:' + S.ws, id);
+  S.selected.clear(); S.selLink = null;
+  clearCards();
+  loadView();
+  index();
+  render();
+}
+
+let uiTimer;
+function reportUi() {
+  clearTimeout(uiTimer);
+  uiTimer = setTimeout(() => api.post('/api/ui', { workspace: S.ws, board: S.boardId }).catch(() => {}), 200);
+}
+
+// ---------------------------------------------------------------- live updates
+const sock = {
+  ws: null, delay: 500,
+  connect() {
+    const proto = location.protocol === 'https:' ? 'wss' : 'ws';
+    const ws = new WebSocket(`${proto}://${location.host}/ws`);
+    this.ws = ws;
+    ws.onopen = () => { this.delay = 500; $('#conn').classList.add('on'); this.subscribe(); scheduleRefresh(); loadWorkspaces(); };
+    ws.onmessage = (e) => {
+      const m = JSON.parse(e.data);
+      if (m.type === 'workspaces') loadWorkspaces();
+      else if (m.workspace === S.ws) scheduleRefresh();
+    };
+    ws.onclose = () => {
+      $('#conn').classList.remove('on');
+      setTimeout(() => this.connect(), this.delay);
+      this.delay = Math.min(this.delay * 2, 8000);
+    };
+  },
+  subscribe() { if (this.ws?.readyState === 1 && S.ws) this.ws.send(JSON.stringify({ subscribe: S.ws })); },
+};
+
+// ---------------------------------------------------------------- view (pan/zoom)
+function viewKey() { return `view:${S.ws}:${S.boardId}`; }
+function loadView() { S.view = Object.assign({ zoom: 1, x: 0, y: 0 }, LS.get(viewKey(), {})); }
+let viewSaveTimer;
+function saveView() { clearTimeout(viewSaveTimer); if (S.ws && S.boardId) LS.set(viewKey(), S.view); }
+function applyView() {
+  const st = $('#stage');
+  st.style.transform = `translate(${S.view.x}px, ${S.view.y}px) scale(${eff()})`;
+  clearTimeout(viewSaveTimer);
+  viewSaveTimer = setTimeout(saveView, 300);
+  updateFrames();
+  renderStatus();
+}
+function setZoom(z, cx, cy) {
+  z = Math.min(8, Math.max(0.03, z));
+  const vp = $('#viewport').getBoundingClientRect();
+  cx ??= vp.width / 2; cy ??= vp.height / 2;
+  const before = eff();
+  const bx = (cx - S.view.x) / before, by_ = (cy - S.view.y) / before;
+  S.view.zoom = z;
+  const after = eff();
+  S.view.x = cx - bx * after;
+  S.view.y = cy - by_ * after;
+  applyView();
+}
+function fitView() {
+  const b = board(); if (!b) return;
+  const vp = $('#viewport').getBoundingClientRect();
+  const k = Math.min(vp.width / b.width, vp.height / b.height) * 0.98;
+  S.view.zoom = k / dprFactor();
+  S.view.x = (vp.width - b.width * k) / 2;
+  S.view.y = (vp.height - b.height * k) / 2;
+  applyView();
+}
+function actualSize() { S.view = { zoom: 1, x: 0, y: 0 }; applyView(); }
+function toBoard(clientX, clientY) {
+  const vp = $('#viewport').getBoundingClientRect();
+  const k = eff();
+  return { x: (clientX - vp.left - S.view.x) / k, y: (clientY - vp.top - S.view.y) / k };
+}
+function snap(v, ev) {
+  const g = settings().grid || 1;
+  if (!S.disp.snap || ev?.altKey || g <= 1) return Math.round(v);
+  return Math.round(v / g) * g;
+}
+
+// ---------------------------------------------------------------- render
+function render() {
+  renderTabs();
+  renderBoard();
+  renderSidebar();
+  renderStatus();
+  if (S.editing && S.editing !== 'new' && !by.finding.has(S.editing)) closeEditor();
+  else if (S.editing && S.editing !== 'new') refreshEditorPlaceButton();
+  reportUi();
+}
+
+function renderWsSelect() {
+  const sel = $('#ws-select');
+  sel.replaceChildren(
+    ...S.workspaces.map((w) => h('option', { value: w.id, selected: w.id === S.ws }, w.name)),
+    h('option', { value: '__new' }, '＋ New workspace…'),
+  );
+  sel.value = S.ws || '';
+}
+
+function renderTabs() {
+  const tabs = $('#tabs');
+  tabs.replaceChildren(...(S.data?.boards || []).map((b) =>
+    h('button', {
+      class: b.id === S.boardId ? 'on' : '',
+      title: 'Double-click to rename',
+      onclick: () => b.id !== S.boardId && selectBoard(b.id),
+      ondblclick: async () => {
+        const name = prompt('Board name', b.name);
+        if (name && name !== b.name) await api.patch(`${W()}/boards/${b.id}`, { name });
+      },
+    }, b.name, h('small', {}, `${b.width}×${b.height}`))));
+}
+
+function renderBoard() {
+  const b = board();
+  const el = $('#board');
+  if (!b) { el.style.width = el.style.height = '0px'; clearCards(); drawLinks(); return; }
+  el.style.width = b.width + 'px';
+  el.style.height = b.height + 'px';
+  el.style.backgroundColor = b.background || '';
+  const g = Math.max(settings().grid || 10, 2) * 5;
+  el.classList.toggle('grid', !!S.disp.grid);
+  el.style.backgroundSize = `${g}px ${g}px`;
+  el.style.backgroundPosition = `${-g / 2}px ${-g / 2}px`;
+  for (const svg of [$('#links'), $('#overlay')]) { svg.setAttribute('width', b.width); svg.setAttribute('height', b.height); }
+
+  const seen = new Set();
+  for (const [fid, g2] of S.geom) {
+    const f = by.finding.get(fid);
+    if (!f) continue;
+    seen.add(fid);
+    let card = S.cardEls.get(fid);
+    if (!card) { card = makeCard(fid); S.cardEls.set(fid, card); $('#cards').append(card); }
+    updateCard(card, f, g2);
+  }
+  for (const [fid, card] of S.cardEls) if (!seen.has(fid)) { card.remove(); S.cardEls.delete(fid); }
+  drawLinks();
+  applyView();
+}
+
+function clearCards() { for (const c of S.cardEls.values()) c.remove(); S.cardEls.clear(); }
+
+function makeCard(fid) {
+  return h('div', { class: 'card', 'data-id': fid },
+    h('div', { class: 'card-head' }, h('span', { class: 'title' }), h('span', { class: 'src' }), h('span', { class: 'kind' })),
+    h('div', { class: 'card-body' }),
+    h('div', { class: 'link-handle', title: 'Drag to another card to link' }),
+    h('div', { class: 'resize-handle' }));
+}
+
+const KIND_LABEL = { md: 'md', text: 'txt', csv: 'table', html: 'html', url: 'web', image: 'img', folder: 'folder' };
+
+function updateCard(card, f, g) {
+  if (!S.drag || !S.drag.ids?.includes(f.id)) {
+    Object.assign(card.style, { left: g.x + 'px', top: g.y + 'px', width: g.w + 'px', height: g.h + 'px', zIndex: 1 + g.z });
+  }
+  card.style.setProperty('--cat', catColor(f.category));
+  card.classList.toggle('sel', S.selected.has(f.id));
+  card.classList.toggle('oob', !!isOOB(g));
+  $('.title', card).textContent = f.title;
+  $('.kind', card).textContent = KIND_LABEL[f.kind] || f.kind;
+  $('.src', card).textContent = f.source || '';
+  card.title = [f.category && `Category: ${f.category}`, f.tags?.length && `Tags: ${f.tags.join(', ')}`].filter(Boolean).join('\n');
+  const ver = f.kind === 'folder'
+    ? f.updated_at + '|' + (by.children.get(f.id) || []).map((c) => c.id + c.title).join(',')
+    : f.updated_at + f.kind;
+  if (card.dataset.ver !== ver) {
+    card.dataset.ver = ver;
+    fillBody($('.card-body', card), f);
+  }
+}
+
+function fillBody(body, f) {
+  body.className = 'card-body';
+  body.replaceChildren();
+  delete body.dataset.loaded;
+  if (f.kind === 'md' || f.kind === 'text' || f.kind === 'csv') {
+    body.classList.add('prose');
+    body.innerHTML = f.rendered || '';
+  } else if (f.kind === 'image') {
+    body.classList.add('framed');
+    body.append(h('img', { src: f.content, alt: f.title, draggable: false }));
+  } else if (f.kind === 'folder') {
+    const kids = by.children.get(f.id) || [];
+    body.append(kids.length
+      ? h('ul', { class: 'folder-list' }, kids.map((k) => h('li', {}, k.title)))
+      : h('div', { class: 'ph' }, 'Empty folder'));
+  } else {
+    body.classList.add('framed');
+    body.append(h('div', { class: 'ph' }, f.kind === 'url' ? (f.content || 'No URL') : 'HTML'));
+  }
+  updateFrames();
+}
+
+function wrapHtml(content) {
+  if (/<html|<body|<!doctype/i.test(content)) return content;
+  return '<!doctype html><meta charset="utf-8"><style>body{font:14px/1.5 system-ui,sans-serif;margin:12px;color:#1d1f23}table{border-collapse:collapse}td,th{border:1px solid #ddd;padding:4px 8px}</style>' + content;
+}
+
+// Live iframes only when the card is on screen and big enough to read.
+let framesQueued = false;
+function updateFrames() {
+  if (framesQueued) return;
+  framesQueued = true;
+  requestAnimationFrame(() => {
+    framesQueued = false;
+    const k = eff();
+    const vp = $('#viewport').getBoundingClientRect();
+    const v0 = toBoard(vp.left, vp.top), v1 = toBoard(vp.right, vp.bottom);
+    for (const [fid, card] of S.cardEls) {
+      const f = by.finding.get(fid);
+      if (!f || (f.kind !== 'html' && f.kind !== 'url')) continue;
+      const g = S.geom.get(fid);
+      if (!g) continue;
+      const body = $('.card-body', card);
+      const visible = g.x < v1.x && g.x + g.w > v0.x && g.y < v1.y && g.y + g.h > v0.y;
+      const readable = k * Math.min(g.w, g.h) > 80;
+      if (visible && readable && !body.dataset.loaded) {
+        body.dataset.loaded = '1';
+        const frame = f.kind === 'html'
+          ? h('iframe', { sandbox: 'allow-scripts allow-popups allow-forms allow-modals', srcdoc: wrapHtml(f.content || ''), loading: 'lazy' })
+          : h('iframe', {
+            src: f.content, loading: 'lazy', referrerpolicy: 'no-referrer',
+            sandbox: 'allow-scripts allow-same-origin allow-forms allow-popups allow-popups-to-escape-sandbox allow-presentation',
+            allow: 'clipboard-write; fullscreen',
+          });
+        body.replaceChildren(frame);
+      } else if (!readable && body.dataset.loaded) {
+        delete body.dataset.loaded;
+        body.replaceChildren(h('div', { class: 'ph' }, f.title));
+      }
+    }
+  });
+}
+
+// ---------------------------------------------------------------- links
+function edgePoint(g, tx, ty, pad = 6) {
+  const cx = g.x + g.w / 2, cy = g.y + g.h / 2;
+  const dx = tx - cx, dy = ty - cy;
+  if (!dx && !dy) return { x: cx, y: cy };
+  const sx = dx ? (g.w / 2 + pad) / Math.abs(dx) : Infinity;
+  const sy = dy ? (g.h / 2 + pad) / Math.abs(dy) : Infinity;
+  const k = Math.min(sx, sy);
+  return { x: cx + dx * k, y: cy + dy * k };
+}
+
+function drawLinks() {
+  const svg = $('#links');
+  svg.replaceChildren();
+  if (!S.data || !board()) return;
+  for (const l of S.data.links) {
+    if (l.board_id !== S.boardId) continue;
+    const a = S.geom.get(l.from_id), b = S.geom.get(l.to_id);
+    if (!a || !b) continue;
+    const ac = { x: a.x + a.w / 2, y: a.y + a.h / 2 }, bc = { x: b.x + b.w / 2, y: b.y + b.h / 2 };
+    const p1 = edgePoint(a, bc.x, bc.y), p2 = edgePoint(b, ac.x, ac.y);
+    const color = l.color || getComputedStyle(document.documentElement).getPropertyValue('--link').trim();
+    const sel = S.selLink === l.id;
+    const g = s('g', { class: 'link' + (sel ? ' sel' : ''), 'data-link': l.id });
+    const stroke = sel ? 'var(--sel)' : color;
+    const ang = Math.atan2(p2.y - p1.y, p2.x - p1.x), L = 13, Wd = 6;
+    const bx = p2.x - Math.cos(ang) * L, by_ = p2.y - Math.sin(ang) * L;
+    g.append(
+      s('line', { class: 'link-hit', x1: p1.x, y1: p1.y, x2: p2.x, y2: p2.y }),
+      s('line', { class: 'link-line', x1: p1.x, y1: p1.y, x2: bx, y2: by_, stroke }),
+      s('polygon', {
+        class: 'link-head', fill: stroke,
+        points: `${p2.x},${p2.y} ${bx - Math.sin(ang) * Wd},${by_ + Math.cos(ang) * Wd} ${bx + Math.sin(ang) * Wd},${by_ - Math.cos(ang) * Wd}`,
+      }),
+    );
+    if (l.label) {
+      const t = s('text', { class: 'link-label', x: (p1.x + p2.x) / 2, y: (p1.y + p2.y) / 2, 'text-anchor': 'middle', 'dominant-baseline': 'middle' });
+      t.style.setProperty('stroke', board().background || 'var(--board)');
+      t.textContent = l.label;
+      g.append(t);
+    }
+    svg.append(g);
+  }
+}
+
+// ---------------------------------------------------------------- sidebar
+function renderSidebar() {
+  $$('.side-tabs button').forEach((b) => b.classList.toggle('on', b.dataset.tab === S.sideTab));
+  const body = $('#side-body');
+  const scroll = body.scrollTop;
+  body.replaceChildren();
+  if (!S.data) return;
+  const q = S.filter.trim().toLowerCase();
+  const match = (f) => !q || f.title.toLowerCase().includes(q) || (f.category || '').toLowerCase().includes(q) || f.tags.some((t) => t.toLowerCase().includes(q));
+
+  if (S.sideTab === 'tree') {
+    if (q) {
+      const hits = S.data.findings.filter(match);
+      body.append(...hits.map((f) => node(f, 0, false)));
+      if (!hits.length) body.append(h('div', { class: 'empty' }, 'Nothing matches.'));
+    } else {
+      const walk = (pid, depth) => {
+        for (const f of by.children.get(pid) || []) {
+          body.append(node(f, depth, true));
+          if (S.expanded.has(f.id)) walk(f.id, depth + 1);
+        }
+      };
+      walk('', 0);
+      if (!S.data.findings.length) body.append(h('div', { class: 'empty' }, 'No findings yet. Agents add them over MCP, or use ＋ Finding.'));
+    }
+  } else if (S.sideTab === 'cats') {
+    const groups = new Map();
+    for (const f of S.data.findings) {
+      if (f.kind === 'folder' || !match(f)) continue;
+      const c = f.category || '';
+      if (!groups.has(c)) groups.set(c, []);
+      groups.get(c).push(f);
+    }
+    const names = [...groups.keys()].sort((a, b) => (a === '') - (b === '') || a.localeCompare(b));
+    for (const c of names) {
+      body.append(h('div', { class: 'group-h' }, h('span', { class: 'cd', style: { background: catColor(c) } }), c || 'Uncategorized', h('span', {}, `(${groups.get(c).length})`)));
+      body.append(...groups.get(c).map((f) => node(f, 0, false)));
+    }
+    if (!names.length) body.append(h('div', { class: 'empty' }, 'No findings.'));
+  } else {
+    const b = board();
+    const rows = [...S.geom.entries()].map(([id, g]) => ({ f: by.finding.get(id), g })).filter((r) => r.f && match(r.f));
+    const out = rows.filter((r) => isOOB(r.g));
+    if (out.length) {
+      body.append(h('div', { class: 'group-h' }, h('span', { class: 'bad' }, `Outside the board (${out.length})`),
+        h('button', { class: 'mini', onclick: () => pullIn(out.map((r) => r.f.id)) }, 'Pull all in')));
+      body.append(...out.map((r) => node(r.f, 0, false, r.g, true)));
+    }
+    rows.sort((a, b) => a.g.y - b.g.y || a.g.x - b.g.x);
+    body.append(h('div', { class: 'group-h' }, `On ${b?.name || 'board'} (${rows.length})`));
+    body.append(...rows.filter((r) => !isOOB(r.g)).map((r) => node(r.f, 0, false, r.g)));
+  }
+  body.scrollTop = scroll;
+}
+
+const KIND_ICON = { md: 'MD', text: 'TXT', csv: 'TBL', html: 'HTM', url: 'WEB', image: 'IMG', folder: 'DIR' };
+
+function node(f, depth, tree, g, oob) {
+  const kids = by.children.get(f.id) || [];
+  const placed = S.geom.has(f.id);
+  const el = h('div', {
+    class: 'node' + (S.treeSel === f.id ? ' sel' : ''), 'data-id': f.id, draggable: 'true',
+    style: { paddingLeft: 6 + depth * 14 + 'px' },
+    title: [f.title, f.category && `Category: ${f.category}`, f.source && `From: ${f.source}`].filter(Boolean).join('\n'),
+    onclick: () => treeClick(f.id),
+    ondblclick: () => openEditor(f.id),
+    ondragstart: (e) => {
+      e.dataTransfer.setData('application/x-ritbord-finding', f.id);
+      e.dataTransfer.setData('text/plain', f.title);
+      e.dataTransfer.effectAllowed = 'copyMove';
+    },
+  },
+  h('span', {
+    class: 'tw',
+    onclick: (e) => {
+      e.stopPropagation();
+      if (!kids.length) return;
+      S.expanded.has(f.id) ? S.expanded.delete(f.id) : S.expanded.add(f.id);
+      LS.set('expanded', [...S.expanded]);
+      renderSidebar();
+    },
+  }, tree && kids.length ? (S.expanded.has(f.id) ? '▾' : '▸') : ''),
+  h('span', { class: 'ki' }, KIND_ICON[f.kind] || f.kind),
+  h('span', { class: 'tt' }, f.title),
+  g ? h('span', { class: 'xy' + (oob ? ' bad' : '') }, `${g.x},${g.y}`) : null,
+  oob ? h('button', { class: 'mini', onclick: (e) => { e.stopPropagation(); pullIn([f.id]); } }, 'Pull in') : null,
+  f.category ? h('span', { class: 'cd', style: { background: catColor(f.category) } }) : null,
+  !g ? h('span', { class: 'ob', title: placed ? 'On this board' : '' }, placed ? '✓' : '') : null);
+
+  if (tree) {
+    el.addEventListener('dragover', (e) => {
+      if (!e.dataTransfer.types.includes('application/x-ritbord-finding')) return;
+      e.preventDefault(); e.stopPropagation();
+      el.classList.add('drop');
+    });
+    el.addEventListener('dragleave', () => el.classList.remove('drop'));
+    el.addEventListener('drop', async (e) => {
+      e.preventDefault(); e.stopPropagation();
+      el.classList.remove('drop');
+      const id = e.dataTransfer.getData('application/x-ritbord-finding');
+      if (!id || id === f.id) return;
+      S.expanded.add(f.id); LS.set('expanded', [...S.expanded]);
+      await api.patch(`${W()}/findings/${id}`, { parent_id: f.id });
+    });
+  }
+  return el;
+}
+
+function treeClick(id) {
+  S.treeSel = id;
+  if (S.geom.has(id)) {
+    S.selected = new Set([id]);
+    S.selLink = null;
+    const card = S.cardEls.get(id);
+    if (card) { card.classList.remove('flash'); void card.offsetWidth; card.classList.add('flash'); }
+  }
+  renderBoardSelection();
+  renderSidebar();
+  renderStatus();
+}
+
+async function pullIn(ids) {
+  const b = board();
+  const items = ids.map((id) => {
+    const g = S.geom.get(id);
+    const w = Math.min(g.w, b.width), hgt = Math.min(g.h, b.height);
+    return { finding_id: id, x: Math.max(0, Math.min(g.x, b.width - w)), y: Math.max(0, Math.min(g.y, b.height - hgt)), w, h: hgt };
+  });
+  await api.put(`${W()}/boards/${S.boardId}/placements`, items);
+}
+
+function renderBoardSelection() {
+  for (const [id, card] of S.cardEls) card.classList.toggle('sel', S.selected.has(id));
+  drawLinks();
+}
+
+function renderStatus() {
+  const st = $('#status');
+  const parts = [`${Math.round(S.view.zoom * 100)}%`];
+  if (S.disp.device && window.devicePixelRatio !== 1) parts.push(`device px (dpr ${window.devicePixelRatio})`);
+  const b = board();
+  if (b) parts.push(`${b.width}×${b.height}`);
+  if (S.selected.size === 1) {
+    const g = S.geom.get([...S.selected][0]);
+    if (g) parts.push(`x ${g.x}  y ${g.y}  w ${g.w}  h ${g.h}`);
+  } else if (S.selected.size > 1) parts.push(`${S.selected.size} selected`);
+  st.textContent = parts.join('  ·  ');
+}
+
+// ---------------------------------------------------------------- board interaction
+function cardAt(clientX, clientY) {
+  const el = document.elementFromPoint(clientX, clientY);
+  return el?.closest?.('.card');
+}
+
+function setSelected(ids) { S.selected = new Set(ids); S.selLink = null; renderBoardSelection(); renderStatus(); }
+
+function bringToFront(ids) {
+  let z = Math.max(0, ...[...S.geom.values()].map((g) => g.z));
+  for (const id of ids) { const g = S.geom.get(id); if (g) g.z = ++z; }
+}
+
+async function savePlacements(ids) {
+  const items = ids.filter((id) => S.geom.has(id)).map((id) => ({ finding_id: id, ...S.geom.get(id) }));
+  if (items.length) await api.put(`${W()}/boards/${S.boardId}/placements`, items);
+}
+
+function onPointerDown(e) {
+  if (!board()) return;
+  const vp = $('#viewport');
+  const t = e.target;
+  // Pan: middle button, or space held.
+  if (e.button === 1 || (e.button === 0 && S.space)) {
+    e.preventDefault();
+    S.drag = { mode: 'pan', sx: e.clientX, sy: e.clientY, vx: S.view.x, vy: S.view.y };
+    vp.classList.add('panning');
+    vp.setPointerCapture(e.pointerId);
+    return;
+  }
+  if (e.button !== 0) return;
+  const card = t.closest('.card');
+  const fid = card?.dataset.id;
+  const pt = toBoard(e.clientX, e.clientY);
+
+  if (t.closest('.link-hit, .link-label')) {
+    const lid = t.closest('.link').dataset.link;
+    S.selLink = lid; S.selected.clear();
+    renderBoardSelection(); renderStatus();
+    return;
+  }
+  if (card && t.classList.contains('resize-handle')) {
+    e.preventDefault();
+    const g = S.geom.get(fid);
+    S.drag = { mode: 'resize', ids: [fid], sx: pt.x, sy: pt.y, g0: { ...g } };
+    if (!S.selected.has(fid)) setSelected([fid]);
+  } else if (card && t.classList.contains('link-handle')) {
+    e.preventDefault();
+    S.drag = { mode: 'link', from: fid };
+    document.body.classList.add('linking');
+  } else if (card && t.closest('.card-head')) {
+    e.preventDefault();
+    if (e.shiftKey || e.ctrlKey || e.metaKey) {
+      S.selected.has(fid) ? S.selected.delete(fid) : S.selected.add(fid);
+      setSelected([...S.selected]);
+      if (!S.selected.has(fid)) return;
+    } else if (!S.selected.has(fid)) setSelected([fid]);
+    const ids = [...S.selected];
+    S.drag = { mode: 'move', ids, sx: pt.x, sy: pt.y, start: new Map(ids.map((id) => [id, { ...S.geom.get(id) }])), lead: fid, moved: false };
+  } else if (card) {
+    // Click in a card body selects it but leaves the content usable (scrolling, links, selecting text).
+    if (!S.selected.has(fid) || S.selected.size > 1) setSelected([fid]);
+    S.treeSel = fid;
+    renderSidebar();
+    return;
+  } else {
+    // Empty space: rubber-band select.
+    S.drag = { mode: 'band', sx: pt.x, sy: pt.y, add: e.shiftKey, base: new Set(S.selected) };
+  }
+  document.body.classList.add('dragging');
+  vp.setPointerCapture(e.pointerId);
+}
+
+function onPointerMove(e) {
+  const d = S.drag;
+  if (!d) return;
+  if (d.mode === 'pan') {
+    S.view.x = d.vx + e.clientX - d.sx;
+    S.view.y = d.vy + e.clientY - d.sy;
+    applyView();
+    return;
+  }
+  const pt = toBoard(e.clientX, e.clientY);
+  const ov = $('#overlay');
+  if (d.mode === 'move') {
+    const dx = pt.x - d.sx, dy = pt.y - d.sy;
+    if (!d.moved && Math.hypot(dx, dy) * eff() < 3) return;
+    d.moved = true;
+    const lead = d.start.get(d.lead);
+    const nx = snap(lead.x + dx, e) - lead.x, ny = snap(lead.y + dy, e) - lead.y;
+    for (const [id, g0] of d.start) {
+      const g = S.geom.get(id);
+      g.x = g0.x + nx; g.y = g0.y + ny;
+      const c = S.cardEls.get(id);
+      c.style.left = g.x + 'px'; c.style.top = g.y + 'px';
+      c.classList.toggle('oob', !!isOOB(g));
+    }
+    drawLinks(); renderStatus();
+  } else if (d.mode === 'resize') {
+    const id = d.ids[0], g = S.geom.get(id), g0 = d.g0;
+    g.w = Math.max(40, snap(g0.x + g0.w + pt.x - d.sx, e) - g0.x);
+    g.h = Math.max(30, snap(g0.y + g0.h + pt.y - d.sy, e) - g0.y);
+    const c = S.cardEls.get(id);
+    c.style.width = g.w + 'px'; c.style.height = g.h + 'px';
+    c.classList.toggle('oob', !!isOOB(g));
+    d.moved = true;
+    drawLinks(); renderStatus();
+  } else if (d.mode === 'link') {
+    const a = S.geom.get(d.from);
+    const p = edgePoint(a, pt.x, pt.y, 0);
+    ov.replaceChildren(s('line', { x1: p.x, y1: p.y, x2: pt.x, y2: pt.y, stroke: 'var(--sel)', 'stroke-width': 2 / eff(), 'stroke-dasharray': `${6 / eff()} ${4 / eff()}` }));
+  } else if (d.mode === 'band') {
+    const x = Math.min(d.sx, pt.x), y = Math.min(d.sy, pt.y), w = Math.abs(pt.x - d.sx), hh = Math.abs(pt.y - d.sy);
+    d.rect = { x, y, w, h: hh };
+    ov.replaceChildren(s('rect', { class: 'band', x, y, width: w, height: hh, 'stroke-width': 1 / eff() }));
+    const ids = new Set(d.add ? d.base : []);
+    for (const [id, g] of S.geom) if (g.x < x + w && g.x + g.w > x && g.y < y + hh && g.y + g.h > y) ids.add(id);
+    S.selected = ids;
+    renderBoardSelection();
+  }
+}
+
+async function onPointerUp(e) {
+  const d = S.drag;
+  if (!d) return;
+  const vp = $('#viewport');
+  vp.classList.remove('panning');
+  document.body.classList.remove('dragging', 'linking');
+  $('#overlay').replaceChildren();
+  try { vp.releasePointerCapture(e.pointerId); } catch { /* not captured */ }
+  try {
+    if (d.mode === 'move' && d.moved) {
+      bringToFront(d.ids);
+      for (const id of d.ids) S.cardEls.get(id).style.zIndex = 1 + S.geom.get(id).z;
+      await savePlacements(d.ids);
+    } else if (d.mode === 'resize' && d.moved) {
+      await savePlacements(d.ids);
+    } else if (d.mode === 'link') {
+      const target = cardAt(e.clientX, e.clientY);
+      if (target && target.dataset.id !== d.from) {
+        await api.post(`${W()}/boards/${S.boardId}/links`, { from_id: d.from, to_id: target.dataset.id });
+      }
+    } else if (d.mode === 'band') {
+      if (!d.rect || d.rect.w * eff() < 3) { if (!d.add) setSelected([]); S.selLink = null; drawLinks(); }
+      renderStatus();
+    }
+  } finally {
+    S.drag = null;
+    if (S.pendingRefresh) { S.pendingRefresh = false; loadState(); }
+    else if (d.mode !== 'pan') renderSidebar();
+  }
+}
+
+function onWheel(e) {
+  if (!board()) return;
+  if (e.ctrlKey || e.metaKey) {
+    e.preventDefault();
+    const vp = $('#viewport').getBoundingClientRect();
+    setZoom(S.view.zoom * Math.exp(-e.deltaY * 0.0015), e.clientX - vp.left, e.clientY - vp.top);
+    return;
+  }
+  // Let scrollable card content scroll.
+  const body = e.target.closest?.('.card-body');
+  if (body && (body.scrollHeight > body.clientHeight + 1 || body.scrollWidth > body.clientWidth + 1)) return;
+  e.preventDefault();
+  const dx = e.shiftKey ? e.deltaY : e.deltaX, dy = e.shiftKey ? 0 : e.deltaY;
+  S.view.x -= dx; S.view.y -= dy;
+  applyView();
+}
+
+function onDrop(e) {
+  const id = e.dataTransfer.getData('application/x-ritbord-finding');
+  if (!id || !board()) return;
+  e.preventDefault();
+  const pt = toBoard(e.clientX, e.clientY);
+  const item = { finding_id: id, x: snap(pt.x - 20), y: snap(pt.y - 15) };
+  api.put(`${W()}/boards/${S.boardId}/placements`, [item]).then(() => { S.selected = new Set([id]); });
+}
+
+async function editLinkLabel(lid) {
+  const l = S.data.links.find((x) => x.id === lid);
+  if (!l) return;
+  const label = prompt('Link label', l.label || '');
+  if (label != null) await api.patch(`${W()}/links/${lid}`, { label });
+}
+
+let nudgeTimer;
+function nudge(dx, dy) {
+  const ids = [...S.selected];
+  for (const id of ids) {
+    const g = S.geom.get(id);
+    g.x += dx; g.y += dy;
+    const c = S.cardEls.get(id);
+    c.style.left = g.x + 'px'; c.style.top = g.y + 'px';
+    c.classList.toggle('oob', !!isOOB(g));
+  }
+  drawLinks(); renderStatus();
+  clearTimeout(nudgeTimer);
+  nudgeTimer = setTimeout(() => savePlacements(ids), 250);
+}
+
+function onKey(e) {
+  const t = e.target;
+  if (t.closest?.('input, textarea, select, [contenteditable], dialog')) {
+    if (e.key === 'Escape' && t.closest('#editor')) closeEditor();
+    return;
+  }
+  if (e.key === ' ') { S.space = true; document.body.classList.add('space'); e.preventDefault(); return; }
+  const step = e.shiftKey ? (settings().grid || 10) : 1;
+  switch (e.key) {
+    case 'Delete': case 'Backspace':
+      if (S.selLink) { api.del(`${W()}/links/${S.selLink}`); S.selLink = null; }
+      else if (S.selected.size) api.post(`${W()}/boards/${S.boardId}/unplace`, [...S.selected]);
+      e.preventDefault(); break;
+    case 'ArrowLeft': if (S.selected.size) { nudge(-step, 0); e.preventDefault(); } break;
+    case 'ArrowRight': if (S.selected.size) { nudge(step, 0); e.preventDefault(); } break;
+    case 'ArrowUp': if (S.selected.size) { nudge(0, -step); e.preventDefault(); } break;
+    case 'ArrowDown': if (S.selected.size) { nudge(0, step); e.preventDefault(); } break;
+    case 'Escape': setSelected([]); drawLinks(); closeEditor(); break;
+    case 'Enter': if (S.selected.size === 1) openEditor([...S.selected][0]); break;
+    case '\\': toggleSidebar(); break;
+    case 'h': case 'H': toggleChrome(); break;
+    case 'f': case 'F': fitView(); break;
+    case '1': actualSize(); break;
+    case '+': case '=': setZoom(S.view.zoom * 1.25); break;
+    case '-': setZoom(S.view.zoom / 1.25); break;
+    case 'a': if (e.ctrlKey || e.metaKey) { setSelected([...S.geom.keys()]); e.preventDefault(); } break;
+    default:
+  }
+}
+
+function toggleSidebar() { document.body.classList.toggle('side-off'); LS.set('sideOff', document.body.classList.contains('side-off')); }
+function toggleChrome() { document.body.classList.toggle('chrome-off'); LS.set('chromeOff', document.body.classList.contains('chrome-off')); }
+
+// ---------------------------------------------------------------- editor
+const HINTS = {
+  md: 'Markdown. Tables, lists and code blocks work. Raw HTML is shown as text.',
+  text: 'Shown as-is in a monospace block.',
+  csv: 'First row is the header. Comma, semicolon, tab or | separated.',
+  html: 'A full HTML document or a fragment. Runs in a sandboxed frame with scripts allowed.',
+  url: 'A page to frame. Many sites refuse framing. For a published Claude artifact, use its embed URL and add this host to the artifact’s allowed domains.',
+  image: 'An image URL or a data: URI.',
+  folder: 'Groups findings in the tree. Placed on a board it lists its children.',
+};
+
+function openEditor(id, parentId) {
+  S.editing = id;
+  const f = id === 'new' ? null : by.finding.get(id);
+  if (id !== 'new' && !f) return;
+  const form = $('#ed-form');
+  $('#editor').hidden = false;
+  $('#ed-heading').textContent = f ? 'Finding' : 'New finding';
+  form.title.value = f?.title || '';
+  form.kind.value = f?.kind || (parentId === 'folder' ? 'folder' : 'md');
+  form.category.value = f?.category || '';
+  form.tags.value = (f?.tags || []).join(', ');
+  form.content.value = f?.content || '';
+  form.dataset.parent = f ? '' : (parentId && parentId !== 'folder' ? parentId : '');
+  $('#ed-place-wrap').hidden = !!f;
+  $('#ed-delete').hidden = !f;
+  $('#ed-toggle-place').hidden = !f;
+  $('#ed-meta').textContent = f ? `${f.id}${f.source ? ' · from ' + f.source : ''} · updated ${new Date(f.updated_at).toLocaleString()}` : '';
+  $('#cat-list').replaceChildren(...Object.keys(settings().categories).map((c) => h('option', { value: c })));
+  kindChanged();
+  refreshEditorPlaceButton();
+  setTimeout(() => (f ? form.content : form.title).focus(), 0);
+}
+function closeEditor() { S.editing = null; $('#editor').hidden = true; }
+function kindChanged() {
+  const k = $('#ed-form').kind.value;
+  $('#ed-hint').textContent = HINTS[k] || '';
+  $('#ed-content-label').firstChild.textContent = k === 'url' ? 'URL ' : k === 'image' ? 'Image URL ' : 'Content ';
+  $('#ed-content-label').hidden = k === 'folder';
+}
+function refreshEditorPlaceButton() {
+  const id = S.editing;
+  if (!id || id === 'new') return;
+  $('#ed-toggle-place').textContent = S.geom.has(id) ? 'Remove from board' : 'Place on board';
+}
+
+async function saveEditor(e) {
+  e.preventDefault();
+  const form = $('#ed-form');
+  const body = {
+    title: form.title.value.trim(),
+    kind: form.kind.value,
+    category: form.category.value.trim() || null,
+    tags: form.tags.value.split(',').map((t) => t.trim()).filter(Boolean),
+    content: form.content.value,
+  };
+  if (S.editing === 'new') {
+    const f = await api.post(`${W()}/findings`, { ...body, parent_id: form.dataset.parent || null, source: 'you' });
+    if (form.place.checked && board()) await api.put(`${W()}/boards/${S.boardId}/placements`, [{ finding_id: f.id }]);
+    S.treeSel = f.id;
+    if (f.parent_id) { S.expanded.add(f.parent_id); LS.set('expanded', [...S.expanded]); }
+    openEditor(f.id);
+  } else {
+    await api.patch(`${W()}/findings/${S.editing}`, body);
+  }
+}
+
+// ---------------------------------------------------------------- settings
+const PRESETS = [[1920, 1080], [2560, 1440], [3840, 2160], [5120, 2880], [7680, 2160], [7680, 4320], [11520, 2160]];
+
+async function openSettings() {
+  const d = $('#settings'), f = $('#set-form'), b = board(), st = settings();
+  const ws = S.data?.workspace;
+  $('#set-board-name').textContent = b ? `— ${b.name}` : '';
+  f.b_name.value = b?.name || '';
+  f.b_w.value = b?.width || '';
+  f.b_h.value = b?.height || '';
+  f.b_bg.value = b?.background || '#ecebe6';
+  $('#presets').replaceChildren(...PRESETS.map(([w, hh]) => h('button', { type: 'button', onclick: () => { f.b_w.value = w; f.b_h.value = hh; } }, `${w}×${hh}`)),
+    h('button', { type: 'button', title: 'This window in device pixels', onclick: () => { f.b_w.value = Math.round(innerWidth * devicePixelRatio); f.b_h.value = Math.round(innerHeight * devicePixelRatio); } }, 'This screen'));
+  f.w_name.value = ws?.name || '';
+  f.w_grid.value = st.grid;
+  f.w_bw.value = st.board_width;
+  f.w_bh.value = st.board_height;
+  $('#set-cats').replaceChildren(...Object.entries(st.categories).map(([name, color]) =>
+    h('label', {}, h('input', { type: 'color', value: color, 'data-cat': name }), name)));
+  f.d_device.checked = S.disp.device;
+  f.d_grid.checked = S.disp.grid;
+  f.d_snap.checked = S.disp.snap;
+  $('#set-dpr').textContent = `This screen reports devicePixelRatio ${window.devicePixelRatio}. Window is ${innerWidth}×${innerHeight} CSS px = ${Math.round(innerWidth * devicePixelRatio)}×${Math.round(innerHeight * devicePixelRatio)} device px.`;
+  const mcp = `${location.origin}/mcp`;
+  $('#set-mcp').textContent = mcp;
+  $('#set-cc').textContent = `claude mcp add --transport http ritbord ${mcp}`;
+  try { $('#set-data').textContent = (await api.get('/api/info')).data_dir; } catch { /* offline */ }
+  d.showModal();
+}
+
+function wireSettings() {
+  const f = $('#set-form');
+  $('#set-board-apply').onclick = async () => {
+    const b = board(); if (!b) return;
+    await api.patch(`${W()}/boards/${b.id}`, { name: f.b_name.value.trim() || b.name, width: +f.b_w.value, height: +f.b_h.value, background: f.b_bg.value === '#ecebe6' ? null : f.b_bg.value });
+    $('#settings').close();
+  };
+  $('#set-board-delete').onclick = async () => {
+    const b = board(); if (!b) return;
+    if (S.data.boards.length <= 1) return toast('A workspace keeps at least one board.');
+    if (!confirm(`Delete board “${b.name}”? Findings stay in the workspace.`)) return;
+    await api.del(`${W()}/boards/${b.id}`);
+    $('#settings').close();
+  };
+  $('#set-ws-apply').onclick = async () => {
+    const cats = {};
+    for (const inp of $$('#set-cats input[type=color]')) cats[inp.dataset.cat] = inp.value;
+    await api.patch(`/api/workspaces/${encodeURIComponent(S.ws)}`, {
+      name: f.w_name.value.trim() || null,
+      settings: { grid: +f.w_grid.value || 10, board_width: +f.w_bw.value, board_height: +f.w_bh.value, categories: cats },
+    });
+    $('#settings').close();
+  };
+  $('#set-ws-delete').onclick = async () => {
+    const name = S.data?.workspace.name;
+    if (prompt(`Type the workspace name to delete it. The file moves to the trash folder.\n\n${name}`) !== name) return;
+    await api.del(`/api/workspaces/${encodeURIComponent(S.ws)}`);
+    $('#settings').close();
+    await loadWorkspaces();
+    if (S.workspaces[0]) await selectWorkspace(S.workspaces[0].id);
+  };
+  for (const k of ['d_device', 'd_grid', 'd_snap']) {
+    f[k].onchange = () => {
+      S.disp = { device: f.d_device.checked, grid: f.d_grid.checked, snap: f.d_snap.checked };
+      LS.set('display', S.disp);
+      renderBoard();
+    };
+  }
+}
+
+// ---------------------------------------------------------------- boot
+function wire() {
+  const vp = $('#viewport');
+  // The board position is owned by pan/zoom only; undo any browser scroll (focus, text selection).
+  vp.addEventListener('scroll', () => { vp.scrollLeft = 0; vp.scrollTop = 0; });
+  vp.addEventListener('pointerdown', onPointerDown);
+  vp.addEventListener('pointermove', onPointerMove);
+  vp.addEventListener('pointerup', onPointerUp);
+  vp.addEventListener('pointercancel', onPointerUp);
+  vp.addEventListener('wheel', onWheel, { passive: false });
+  vp.addEventListener('dragover', (e) => { if (e.dataTransfer.types.includes('application/x-ritbord-finding')) { e.preventDefault(); e.dataTransfer.dropEffect = 'copy'; } });
+  vp.addEventListener('drop', onDrop);
+  vp.addEventListener('click', (e) => {
+    const a = e.target.closest('.card-body a[href]');
+    if (a) { e.preventDefault(); window.open(a.href, '_blank', 'noopener'); }
+  });
+  vp.addEventListener('dblclick', (e) => {
+    // Pointer capture can retarget click events to the viewport, so look up what is under the pointer.
+    const t = document.elementFromPoint(e.clientX, e.clientY) || e.target;
+    const link = t.closest('.link');
+    if (link) return editLinkLabel(link.dataset.link);
+    const card = t.closest('.card');
+    if (card && t.closest('.card-head')) openEditor(card.dataset.id);
+  });
+  vp.addEventListener('auxclick', (e) => { if (e.button === 1) e.preventDefault(); });
+  window.addEventListener('keydown', onKey);
+  window.addEventListener('keyup', (e) => { if (e.key === ' ') { S.space = false; document.body.classList.remove('space'); } });
+  window.addEventListener('blur', () => { S.space = false; document.body.classList.remove('space'); });
+  // Scaling changes (moving the window to another monitor) change device pixels; resizing does not.
+  const watchDpr = () => {
+    const mq = matchMedia(`(resolution: ${window.devicePixelRatio}dppx)`);
+    mq.addEventListener('change', () => { applyView(); watchDpr(); }, { once: true });
+  };
+  watchDpr();
+  window.addEventListener('focus', reportUi);
+
+  $('#btn-sidebar').onclick = toggleSidebar;
+  $('#btn-chrome').onclick = toggleChrome;
+  $('#btn-fit').onclick = fitView;
+  $('#btn-actual').onclick = actualSize;
+  $('#btn-settings').onclick = openSettings;
+  $('#btn-add-board').onclick = async () => {
+    if (!S.ws) return;
+    const name = prompt('New board name', `Board ${(S.data?.boards.length || 0) + 1}`);
+    if (!name) return;
+    const b = await api.post(`${W()}/boards`, { name });
+    await loadState();
+    selectBoard(b.id);
+  };
+  $('#ws-select').onchange = async (e) => {
+    const v = e.target.value;
+    if (v === '__new') {
+      const name = prompt('New workspace name');
+      if (!name) { e.target.value = S.ws; return; }
+      const w = await api.post('/api/workspaces', { name });
+      await loadWorkspaces();
+      await selectWorkspace(w.id);
+      renderWsSelect();
+    } else await selectWorkspace(v);
+  };
+  $$('.side-tabs button').forEach((b) => (b.onclick = () => { S.sideTab = b.dataset.tab; LS.set('sideTab', S.sideTab); renderSidebar(); }));
+  $('#side-search').oninput = (e) => { S.filter = e.target.value; renderSidebar(); };
+  const sb = $('#side-body');
+  sb.addEventListener('dragover', (e) => { if (e.dataTransfer.types.includes('application/x-ritbord-finding')) { e.preventDefault(); sb.classList.add('drop-root'); } });
+  sb.addEventListener('dragleave', (e) => { if (e.target === sb) sb.classList.remove('drop-root'); });
+  sb.addEventListener('drop', async (e) => {
+    sb.classList.remove('drop-root');
+    const id = e.dataTransfer.getData('application/x-ritbord-finding');
+    if (!id || S.sideTab !== 'tree') return;
+    e.preventDefault();
+    if (by.finding.get(id)?.parent_id) await api.patch(`${W()}/findings/${id}`, { parent_id: null });
+  });
+  const parentForNew = () => { const t = by.finding.get(S.treeSel); return t ? (t.kind === 'folder' ? t.id : t.parent_id) : null; };
+  $('#btn-new-finding').onclick = () => openEditor('new', parentForNew());
+  $('#btn-new-folder').onclick = async () => {
+    const name = prompt('Folder name');
+    if (!name) return;
+    const f = await api.post(`${W()}/findings`, { title: name, kind: 'folder', parent_id: parentForNew(), source: 'you' });
+    S.treeSel = f.id;
+  };
+  $('#ed-form').addEventListener('submit', saveEditor);
+  $('#ed-form').kind.addEventListener('change', kindChanged);
+  $('#ed-close').onclick = closeEditor;
+  $('#ed-toggle-place').onclick = async () => {
+    const id = S.editing;
+    if (!id || !board()) return;
+    if (S.geom.has(id)) await api.post(`${W()}/boards/${S.boardId}/unplace`, [id]);
+    else await api.put(`${W()}/boards/${S.boardId}/placements`, [{ finding_id: id }]);
+  };
+  $('#ed-delete').onclick = async () => {
+    const f = by.finding.get(S.editing);
+    if (!f) return;
+    const kids = (by.children.get(f.id) || []).length;
+    if (!confirm(`Delete “${f.title}” from the workspace and every board?${kids ? `\nIts ${kids} children move up a level.` : ''}`)) return;
+    await api.del(`${W()}/findings/${f.id}`);
+    closeEditor();
+  };
+  wireSettings();
+}
+
+async function main() {
+  if (LS.get('sideOff', false)) document.body.classList.add('side-off');
+  if (LS.get('chromeOff', false)) document.body.classList.add('chrome-off');
+  wire();
+  await loadWorkspaces();
+  const remembered = LS.get('ws');
+  const params = new URLSearchParams(location.search);
+  const wanted = params.get('workspace') || remembered;
+  const ws = S.workspaces.find((w) => w.id === wanted) || S.workspaces[0];
+  if (ws) await selectWorkspace(ws.id);
+  renderWsSelect();
+  sock.connect();
+}
+
+main().catch((e) => toast(String(e)));

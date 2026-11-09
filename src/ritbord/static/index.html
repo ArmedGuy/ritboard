@@ -1,0 +1,148 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Ritbord</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect x='3' y='5' width='26' height='20' rx='2' fill='%23ecebe6' stroke='%232b2e33' stroke-width='2'/%3E%3Crect x='7' y='9' width='8' height='6' fill='%2300798c'/%3E%3Crect x='18' y='14' width='7' height='7' fill='%23d1495b'/%3E%3Cpath d='M15 12 L18 17' stroke='%232b2e33' stroke-width='1.5'/%3E%3C/svg%3E">
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<div id="viewport">
+  <div id="stage">
+    <div id="board">
+      <svg id="links" xmlns="http://www.w3.org/2000/svg"></svg>
+      <div id="cards"></div>
+      <svg id="overlay" xmlns="http://www.w3.org/2000/svg"></svg>
+    </div>
+  </div>
+</div>
+
+<div id="hotzone"></div>
+<header id="topbar">
+  <button id="btn-sidebar" class="icon" title="Findings panel (\)">☰</button>
+  <select id="ws-select" title="Workspace"></select>
+  <nav id="tabs"></nav>
+  <button id="btn-add-board" class="icon" title="New board">＋</button>
+  <div class="spacer"></div>
+  <span id="conn" title="Live updates"></span>
+  <button id="btn-fit" class="text" title="Fit board to window (F)">Fit</button>
+  <button id="btn-actual" class="text" title="Actual size (1)">1:1</button>
+  <button id="btn-settings" class="icon" title="Settings">⚙</button>
+  <button id="btn-chrome" class="icon" title="Hide bars (H)">⤢</button>
+</header>
+
+<aside id="sidebar">
+  <div class="side-tabs">
+    <button data-tab="tree" class="on">Findings</button>
+    <button data-tab="cats">Categories</button>
+    <button data-tab="board">On board</button>
+  </div>
+  <input id="side-search" type="search" placeholder="Filter">
+  <div id="side-body"></div>
+  <div class="side-foot">
+    <button id="btn-new-finding">＋ Finding</button>
+    <button id="btn-new-folder">＋ Folder</button>
+  </div>
+</aside>
+
+<aside id="editor" hidden>
+  <form id="ed-form">
+    <div class="ed-head">
+      <strong id="ed-heading">Finding</strong>
+      <button type="button" class="icon" id="ed-close" title="Close (Esc)">✕</button>
+    </div>
+    <label>Title <input name="title" required></label>
+    <div class="row">
+      <label>Kind
+        <select name="kind">
+          <option value="md">Markdown</option>
+          <option value="text">Plain text</option>
+          <option value="csv">Table (CSV)</option>
+          <option value="html">HTML document</option>
+          <option value="url">Web page (URL)</option>
+          <option value="image">Image</option>
+          <option value="folder">Folder</option>
+        </select>
+      </label>
+      <label>Category <input name="category" list="cat-list"></label>
+    </div>
+    <label>Tags <input name="tags" placeholder="comma separated"></label>
+    <label id="ed-content-label">Content <textarea name="content" spellcheck="false"></textarea></label>
+    <p class="hint" id="ed-hint"></p>
+    <p class="meta" id="ed-meta"></p>
+    <label class="check" id="ed-place-wrap"><input type="checkbox" name="place" checked> Place on current board</label>
+    <div class="ed-actions">
+      <button type="submit" class="primary">Save</button>
+      <button type="button" id="ed-toggle-place"></button>
+      <span class="spacer"></span>
+      <button type="button" id="ed-delete" class="danger">Delete</button>
+    </div>
+  </form>
+  <datalist id="cat-list"></datalist>
+</aside>
+
+<div id="status"></div>
+<div id="toast" hidden></div>
+
+<dialog id="settings">
+  <form method="dialog" id="set-form">
+    <div class="ed-head"><strong>Settings</strong><button value="close" class="icon">✕</button></div>
+
+    <section>
+      <h3>Board <span id="set-board-name"></span></h3>
+      <div class="row">
+        <label>Name <input name="b_name"></label>
+        <label>Background <input name="b_bg" type="color"></label>
+      </div>
+      <div class="row">
+        <label>Width (px) <input name="b_w" type="number" min="100" step="1"></label>
+        <label>Height (px) <input name="b_h" type="number" min="100" step="1"></label>
+      </div>
+      <div class="presets" id="presets"></div>
+      <p class="hint">Resizing never moves cards. Cards left outside are outlined and listed under “On board”.</p>
+      <div class="row-actions">
+        <button type="button" id="set-board-apply" class="primary">Apply to board</button>
+        <button type="button" id="set-board-delete" class="danger">Delete board</button>
+      </div>
+    </section>
+
+    <section>
+      <h3>Workspace</h3>
+      <div class="row">
+        <label>Name <input name="w_name"></label>
+        <label>Grid (px) <input name="w_grid" type="number" min="1" step="1"></label>
+      </div>
+      <div class="row">
+        <label>New board width <input name="w_bw" type="number" min="100"></label>
+        <label>New board height <input name="w_bh" type="number" min="100"></label>
+      </div>
+      <div id="set-cats"></div>
+      <div class="row-actions">
+        <button type="button" id="set-ws-apply" class="primary">Apply to workspace</button>
+        <button type="button" id="set-ws-delete" class="danger">Delete workspace</button>
+      </div>
+    </section>
+
+    <section>
+      <h3>This screen</h3>
+      <label class="check"><input type="checkbox" name="d_device"> 1 board pixel = 1 device pixel (ignore OS display scaling)</label>
+      <label class="check"><input type="checkbox" name="d_grid"> Show grid</label>
+      <label class="check"><input type="checkbox" name="d_snap"> Snap to grid (hold Alt to override)</label>
+      <p class="hint" id="set-dpr"></p>
+    </section>
+
+    <section>
+      <h3>Agents</h3>
+      <p class="hint">MCP endpoint (Streamable HTTP):</p>
+      <code id="set-mcp" class="copy"></code>
+      <p class="hint">Claude Code:</p>
+      <code id="set-cc" class="copy"></code>
+      <p class="hint">Data folder: <span id="set-data"></span></p>
+    </section>
+  </form>
+</dialog>
+
+<script type="module" src="/static/app.js"></script>
+</body>
+</html>
