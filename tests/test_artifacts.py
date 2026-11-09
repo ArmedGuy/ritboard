@@ -46,7 +46,7 @@ def test_artifact_lifecycle(server):  # noqa: F811
                 "workspace": ws, "artifact_id": a["id"], "html": "<h1>v2</h1>", "remove": ["app.js"], "note": "simpler",
             }))
             assert v2["latest"] == 2 and {f["path"] for f in v2["files"]} == {"index.html", "data/rows.json", "img/dot.png"}
-            assert httpx.get(f"{server}/w/{ws}/a/{a['id']}/").text == "<h1>v2</h1>"
+            assert httpx.get(f"{server}/w/{ws}/a/{a['id']}/").text.endswith("<h1>v2</h1>")
             old = httpx.get(f"{server}/w/{ws}/a/{a['id']}@1/app.js")
             assert old.status_code == 200 and "immutable" in old.headers["cache-control"]
 
@@ -78,7 +78,7 @@ def test_artifact_from_ui_api(server):  # noqa: F811
     assert out["finding"]["kind"] == "artifact"
     v = httpx.post(f"{server}/api/w/{ws}/artifacts/{aid}/versions", json={"files": {"index.html": "<p>two</p>"}}).json()
     assert v["latest"] == 2
-    assert httpx.get(f"{server}/w/{ws}/a/{aid}@1/").text == "<p>one</p>"
+    assert httpx.get(f"{server}/w/{ws}/a/{aid}@1/").text.endswith("<p>one</p>")
     pinned = httpx.post(f"{server}/api/w/{ws}/findings", json={"title": "Pinned", "kind": "artifact", "content": f"{aid}@1"})
     assert pinned.status_code == 200
     bad = httpx.post(f"{server}/api/w/{ws}/findings", json={"title": "Bad", "kind": "artifact", "content": f"{aid}@9"})
@@ -99,5 +99,40 @@ def test_claude_links_are_refused(server):  # noqa: F811
             moved = data(await c.call_tool("update_finding", {
                 "workspace": ws, "finding_id": ok["id"], "kind": "artifact", "content": pub["artifact"]["id"]}))
             assert moved["kind"] == "artifact"
+
+    asyncio.run(run())
+
+
+def test_artifact_database(server):  # noqa: F811
+    async def run():
+        async with Client(server + "/mcp") as c:
+            ws = data(await c.call_tool("create_workspace", {"name": "Db"}))["workspace"]["id"]
+            aid = data(await c.call_tool("publish_artifact", {"workspace": ws, "title": "p", "html": "<head></head><p>x</p>"}))["artifact"]["id"]
+            page = httpx.get(f"{server}/w/{ws}/a/{aid}/").text
+            assert f'<script src="/w/{ws}/a/{aid}/_ritboard.js"></script>' in page
+            assert "window.claude" in httpx.get(f"{server}/w/{ws}/a/{aid}/_ritboard.js").text
+
+            base = f"{server}/w/{ws}/a/{aid}/_db"
+            first = httpx.get(base, params={"c": "plan"}).json()
+            assert first == {"rev": 0, "docs": []}
+            assert httpx.get(base, params={"c": "plan", "rev": 0}).json()["unchanged"] is True
+            r = httpx.put(base + "/doc", params={"c": "plan", "id": "bed1"}, json={"label": "Bed", "pts": [1, 2]})
+            assert r.status_code == 200 and r.headers["access-control-allow-origin"] == "*"
+            r = httpx.patch(base + "/doc", params={"c": "plan", "id": "bed1"}, json={"note": "kale"})
+            assert r.json()["data"] == {"label": "Bed", "pts": [1, 2], "note": "kale"} and r.json()["version"] == 2
+            assert httpx.options(base + "/doc").status_code == 204
+
+            got = data(await c.call_tool("artifact_data", {"workspace": ws, "artifact_id": aid, "action": "list", "collection": "plan"}))
+            assert got["docs"][0]["data"]["note"] == "kale"
+            stale = await c.call_tool("artifact_data", {"workspace": ws, "artifact_id": aid, "action": "update",
+                                                          "collection": "plan", "doc_id": "bed1", "data": {"x": 1}, "if_version": 1})
+            assert stale.is_error and "version 2" in stale.content[0].text
+            data(await c.call_tool("artifact_data", {"workspace": ws, "artifact_id": aid, "action": "set",
+                                                     "collection": "plan", "doc_id": "pin", "data": {"x": 1}}))
+            cols = data(await c.call_tool("artifact_data", {"workspace": ws, "artifact_id": aid, "action": "collections"}))
+            assert cols["collections"] == [{"collection": "plan", "docs": 2}]
+            assert httpx.delete(base + "/doc", params={"c": "plan", "id": "bed1"}).status_code == 204
+            assert [d["id"] for d in httpx.get(base, params={"c": "plan"}).json()["docs"]] == ["pin"]
+            assert httpx.put(base + "/doc", params={"c": "../x", "id": "a"}, json={}).status_code == 400
 
     asyncio.run(run())

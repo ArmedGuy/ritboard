@@ -21,7 +21,7 @@ from starlette.types import ASGIApp, Receive, Scope, Send
 from . import __version__
 from .hub import Hub
 from .mcp_tools import build_mcp
-from .store import NotFound, Registry, parse_artifact_ref
+from .store import Conflict, NotFound, Registry, parse_artifact_ref
 
 STATIC = Path(__file__).parent / "static"
 ARTIFACT_PATH = re.compile(r"^/w/[^/]+/a/")
@@ -124,6 +124,22 @@ class PlacementItem(BaseModel):
     w: int | None = None
     h: int | None = None
     z: int | None = None
+
+
+RUNTIME_JS = STATIC / "artifact-runtime.js"
+_HEAD_OPEN = re.compile(rb"<head\b[^>]*>", re.I)
+_DOC_START = re.compile(rb"^\s*(<!doctype[^>]*>)?\s*(<html\b[^>]*>)?", re.I)
+
+
+def inject_runtime(html: bytes, src: str) -> bytes:
+    """Load the Ritboard runtime before any of the page's own scripts."""
+    tag = f'<script src="{src}"></script>'.encode()
+    m = _HEAD_OPEN.search(html)
+    if m:
+        return html[: m.end()] + tag + html[m.end():]
+    m = _DOC_START.match(html)
+    end = m.end() if m else 0
+    return html[:end] + tag + html[end:]
 
 
 class ArtifactCreate(BaseModel):
@@ -370,6 +386,80 @@ def create_app(cfg: Config) -> FastAPI:
         # Relative links inside the artifact need the trailing slash.
         return RedirectResponse(f"/w/{ws}/a/{ref}/", status_code=308)
 
+    # The artifact's own database, used by pages through window.claude.use("db").
+    # Pages run with an opaque origin, so these answer cross-origin requests.
+    DB_CORS = {
+        "Access-Control-Allow-Origin": "*",
+        "Access-Control-Allow-Methods": "GET, PUT, PATCH, DELETE, OPTIONS",
+        "Access-Control-Allow-Headers": "Content-Type",
+        "Access-Control-Max-Age": "600",
+        "Cache-Control": "no-store",
+    }
+
+    def db_json(data: Any, status: int = 200) -> Response:
+        return JSONResponse(data, status_code=status, headers=DB_CORS)
+
+    def db_call(fn):
+        try:
+            return fn()
+        except NotFound as e:
+            return db_json({"detail": str(e)}, 404)
+        except Conflict as e:
+            return db_json({"detail": str(e)}, 409)
+        except ValueError as e:
+            return db_json({"detail": str(e)}, 413 if "larger than" in str(e) else 400)
+
+    @app.options("/w/{ws}/a/{ref}/_db")
+    @app.options("/w/{ws}/a/{ref}/_db/doc")
+    async def db_preflight(ws: str, ref: str):
+        return Response(status_code=204, headers=DB_CORS)
+
+    @app.get("/w/{ws}/a/{ref}/_db")
+    async def db_list(ws: str, ref: str, c: str, rev: int = -1):
+        st, aid = reg.get(ws), parse_artifact_ref(ref)[0]
+
+        def run():
+            cur = st.db_rev(aid)
+            if rev == cur:
+                st.artifact_meta(aid)
+                return db_json({"rev": cur, "unchanged": True})
+            return db_json({"rev": cur, "docs": st.db_list(aid, c)})
+
+        return db_call(run)
+
+    @app.get("/w/{ws}/a/{ref}/_db/doc")
+    async def db_get(ws: str, ref: str, c: str, id: str):
+        st, aid = reg.get(ws), parse_artifact_ref(ref)[0]
+        return db_call(lambda: db_json(st.db_get(aid, c, id)))
+
+    @app.put("/w/{ws}/a/{ref}/_db/doc")
+    async def db_set(ws: str, ref: str, c: str, id: str, body: Any = Body(...)):
+        st, aid = reg.get(ws), parse_artifact_ref(ref)[0]
+        return db_call(lambda: db_json(st.db_write(aid, c, id, body)))
+
+    @app.patch("/w/{ws}/a/{ref}/_db/doc")
+    async def db_update(ws: str, ref: str, c: str, id: str, body: Any = Body(...)):
+        st, aid = reg.get(ws), parse_artifact_ref(ref)[0]
+        return db_call(lambda: db_json(st.db_write(aid, c, id, body, merge=True)))
+
+    @app.delete("/w/{ws}/a/{ref}/_db/doc")
+    async def db_delete(ws: str, ref: str, c: str, id: str):
+        st, aid = reg.get(ws), parse_artifact_ref(ref)[0]
+
+        def run():
+            st.db_delete(aid, c, id)
+            return Response(status_code=204, headers=DB_CORS)
+
+        return db_call(run)
+
+    @app.get("/w/{ws}/a/{ref}/_ritboard.js")
+    async def artifact_runtime(ws: str, ref: str):
+        return Response(
+            RUNTIME_JS.read_bytes(),
+            media_type="text/javascript; charset=utf-8",
+            headers={"Access-Control-Allow-Origin": "*", "Cache-Control": "no-cache"},
+        )
+
     @app.get("/w/{ws}/a/{ref}/{path:path}")
     async def artifact_file(ws: str, ref: str, path: str):
         aid, version = parse_artifact_ref(ref)
@@ -377,6 +467,8 @@ def create_app(cfg: Config) -> FastAPI:
             data, ctype = reg.get(ws).artifact_file(aid, version, path)
         except NotFound as e:
             return Response(str(e), status_code=404, media_type="text/plain", headers={"Content-Security-Policy": ARTIFACT_CSP})
+        if ctype.startswith("text/html"):
+            data = inject_runtime(data, f"/w/{ws}/a/{aid}/_ritboard.js")
         headers = {
             "Content-Security-Policy": ARTIFACT_CSP,
             "Access-Control-Allow-Origin": "*",  # the sandboxed page fetches its own files from an opaque origin

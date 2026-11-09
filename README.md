@@ -41,7 +41,7 @@ Tools: `list_workspaces`, `current_workspace`, `create_workspace`, `update_works
 `get_overview`, `list_findings`, `get_finding`, `add_finding`, `add_findings`,
 `update_finding`, `delete_finding`, `create_board`, `update_board`, `delete_board`,
 `get_board`, `place_findings`, `remove_from_board`, `publish_artifact`, `update_artifact`,
-`get_artifact`, `list_artifacts`, `delete_artifact`.
+`get_artifact`, `list_artifacts`, `artifact_data`, `delete_artifact`.
 
 Claude Desktop only starts MCP servers as local commands (stdio). `ritboard mcp` is that
 command: it forwards every call to the running Ritboard over its local HTTP socket, so there
@@ -121,6 +121,12 @@ scripts, styles, data and images. Every publish is a numbered version, kept whol
   and CDN libraries load, but they can't call Ritboard's API, and cookies and localStorage
   are off. With `--token`, artifact pages are reachable without the token; their ids are
   long and random.
+- Each artifact has its own small database. Pages reach it the same way claude.ai artifacts
+  do: `const db = await window.claude.use("db")`, then `db.collection("plan")` with `doc(id)`,
+  `set`, `update`, `delete`, `get`, `add` and `onSnapshot`. Ritboard loads a small runtime
+  into every artifact page for this; open pages see changes within about 1.5 seconds.
+  Agents read and write the same data with the `artifact_data` tool. Other claude.ai page
+  features (calling Claude, user identity, file uploads) don't exist here.
 - Agents use `publish_artifact` (with `html` for one page or `files` for several) and
   `update_artifact` (changed files only; the rest carry over). In the UI, make one with
   ＋ Finding → kind Artifact, edit its `index.html` from the card, and manage them in the

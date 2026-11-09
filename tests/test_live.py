@@ -159,7 +159,8 @@ def test_token_gate_lets_artifact_pages_through(tmp_path):
     try:
         ws = httpx.post(url + "/api/workspaces", json={"name": "T"}, headers=auth).json()["id"]
         aid = httpx.post(f"{url}/api/w/{ws}/artifacts", json={"title": "P", "files": {"index.html": "ok"}}, headers=auth).json()["artifact"]["id"]
-        assert httpx.get(f"{url}/w/{ws}/a/{aid}/").text == "ok"
+        assert httpx.get(f"{url}/w/{ws}/a/{aid}/").text.endswith("ok")
+        assert httpx.put(f"{url}/w/{ws}/a/{aid}/_db/doc", params={"c": "p", "id": "d"}, json={"a": 1}).status_code == 200
         assert httpx.get(f"{url}/api/w/{ws}/artifacts").status_code == 401
     finally:
         srv.should_exit = True

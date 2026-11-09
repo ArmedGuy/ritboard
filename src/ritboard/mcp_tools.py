@@ -28,6 +28,12 @@ Model:
   page, app, chart or report worth revising; update_artifact makes a new version and every
   card showing it reloads. Relative links between its files work. Pages run sandboxed: no
   access to Ritboard's API, no cookies or localStorage; libraries from CDNs load normally.
+  Each artifact has its own small database, reached from the page the same way as in
+  claude.ai artifacts: `const db = await window.claude.use("db");` then
+  `db.collection("plan").doc(id).set({...})`, `.update()`, `.delete()`, `.get()`,
+  `collection.add()`, `collection.get()` and `collection.onSnapshot(snap => snap.docChanges())`.
+  Other claude.ai capabilities (window.claude.complete, user, assets) don't exist here.
+  Agents read and write the same data with artifact_data.
 - Never post claude.ai or claude.site links (Claude artifacts) as url cards; they are refused,
   because claude.ai can't be shown inside another page. Publish the artifact's HTML with
   publish_artifact instead: get the HTML (from your own output, or by reading the artifact)
@@ -394,6 +400,41 @@ def build_mcp(reg: Registry, ui_state: dict[str, Any], base_url: str = "") -> MC
         """All artifacts in a workspace: id, title, latest version, file count, size, address."""
         st = reg.get(workspace)
         return {"artifacts": [art_out(st.id, a) for a in st.list_artifacts()]}
+
+    @tool
+    async def artifact_data(
+        workspace: str,
+        artifact_id: str,
+        action: str,
+        collection: str | None = None,
+        doc_id: str | None = None,
+        data: dict[str, Any] | None = None,
+        if_version: int | None = None,
+    ) -> dict[str, Any]:
+        """Read or write an artifact's own database (what its page sees through
+        window.claude.use("db")). action: collections, list, get, set (replace), update (merge;
+        {"__delete__": true} removes a field) or delete. Pass if_version from a read to avoid
+        overwriting someone's change. Open pages pick up writes within a couple of seconds."""
+        st = reg.get(workspace)
+        aid = artifact_id
+        if action == "collections":
+            return {"collections": st.db_collections(aid)}
+        if not collection:
+            raise ValueError("collection is required")
+        if action == "list":
+            return {"collection": collection, "docs": st.db_list(aid, collection)}
+        if not doc_id:
+            raise ValueError("doc_id is required")
+        if action == "get":
+            return st.db_get(aid, collection, doc_id)
+        if action in ("set", "update"):
+            if data is None:
+                raise ValueError("data is required")
+            return st.db_write(aid, collection, doc_id, data, merge=action == "update", if_version=if_version)
+        if action == "delete":
+            st.db_delete(aid, collection, doc_id, if_version)
+            return {"deleted": f"{collection}/{doc_id}"}
+        raise ValueError("action must be collections, list, get, set, update or delete")
 
     @tool
     async def delete_artifact(workspace: str, artifact_id: str) -> dict[str, Any]:

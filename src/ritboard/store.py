@@ -43,6 +43,8 @@ DEFAULT_SIZES = {
 }
 
 ARTIFACT_MAX_BYTES = 16 * 1024 * 1024  # per version, all files together
+DOC_MAX_BYTES = 1024 * 1024  # one artifact database document
+_SEGMENT = re.compile(r"^[A-Za-z0-9_\-.~:@+]{1,200}$")
 
 PALETTE = ["#d1495b", "#edae49", "#00798c", "#30638e", "#6a994e", "#8d6a9f", "#c97b63", "#4f6d7a"]
 
@@ -107,10 +109,27 @@ CREATE TABLE IF NOT EXISTS artifact_files (
     content_type TEXT NOT NULL,
     PRIMARY KEY (artifact_id, version, path)
 );
+CREATE TABLE IF NOT EXISTS artifact_docs (
+    artifact_id TEXT NOT NULL REFERENCES artifacts(id) ON DELETE CASCADE,
+    collection TEXT NOT NULL,
+    doc_id TEXT NOT NULL,
+    data TEXT NOT NULL,
+    version INTEGER NOT NULL,
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY (artifact_id, collection, doc_id)
+);
+CREATE TABLE IF NOT EXISTS artifact_db_rev (
+    artifact_id TEXT PRIMARY KEY REFERENCES artifacts(id) ON DELETE CASCADE,
+    rev INTEGER NOT NULL
+);
 """
 
 
 class NotFound(LookupError):
+    pass
+
+
+class Conflict(ValueError):
     pass
 
 
@@ -131,7 +150,39 @@ def clean_path(path: str) -> str:
     parts = p.split("/")
     if not p or p.startswith("/") or len(p) > 240 or any(s in ("", ".", "..") for s in parts):
         raise ValueError(f"bad file path {path!r}; use a relative path like 'index.html' or 'data/rows.json'")
+    if parts[0] in ("_db", "_ritboard.js"):
+        raise ValueError(f"{parts[0]} is reserved for Ritboard; pick another file name")
     return p
+
+
+def check_collection(path: str) -> str:
+    segs = (path or "").split("/")
+    if not 1 <= len(segs) <= 15 or len(segs) % 2 == 0 or not all(_SEGMENT.match(s) and s not in (".", "..") for s in segs):
+        raise ValueError(
+            f"bad collection {path!r}: 1 to 15 '/'-separated parts (an odd number), letters, digits and _-.~:@+"
+        )
+    return path
+
+
+def check_doc_id(doc_id: str) -> str:
+    if not _SEGMENT.match(doc_id or "") or doc_id in (".", ".."):
+        raise ValueError(f"bad document id {doc_id!r}")
+    return doc_id
+
+
+def merge_doc(old: Any, patch: Any) -> Any:
+    """Deep merge for 'update': nested objects merge; {"__delete__": true} removes a field."""
+    if not isinstance(old, dict) or not isinstance(patch, dict):
+        return patch
+    out = dict(old)
+    for k, v in patch.items():
+        if isinstance(v, dict) and v.get("__delete__") is True and len(v) == 1:
+            out.pop(k, None)
+        elif isinstance(v, dict) and isinstance(out.get(k), dict):
+            out[k] = merge_doc(out[k], v)
+        else:
+            out[k] = v
+    return out
 
 
 def content_type(path: str) -> str:
@@ -747,6 +798,94 @@ class WorkspaceStore:
             db.execute("DELETE FROM artifacts WHERE id=?", (aid,))
         self.changed("artifacts")
         return {"deleted": aid, "cards_removed": n}
+
+    # ---- artifact database --------------------------------------------
+    # Each artifact gets a small document store its pages use through window.claude.use("db").
+    # `rev` goes up on every write so pages can poll cheaply.
+
+    def db_rev(self, aid: str) -> int:
+        rows = self._q("SELECT rev FROM artifact_db_rev WHERE artifact_id=?", (aid,))
+        return rows[0]["rev"] if rows else 0
+
+    @staticmethod
+    def _doc_row(r: sqlite3.Row) -> dict[str, Any]:
+        return {"id": r["doc_id"], "data": json.loads(r["data"]), "version": r["version"], "updatedAt": r["updated_at"]}
+
+    def db_list(self, aid: str, collection: str) -> list[dict[str, Any]]:
+        self.artifact_meta(aid)
+        check_collection(collection)
+        return [self._doc_row(r) for r in self._q(
+            "SELECT * FROM artifact_docs WHERE artifact_id=? AND collection=? ORDER BY doc_id", (aid, collection)
+        )]
+
+    def db_collections(self, aid: str) -> list[dict[str, Any]]:
+        self.artifact_meta(aid)
+        return [dict(r) for r in self._q(
+            "SELECT collection, COUNT(*) docs FROM artifact_docs WHERE artifact_id=? GROUP BY collection ORDER BY collection",
+            (aid,),
+        )]
+
+    def db_get(self, aid: str, collection: str, doc_id: str) -> dict[str, Any]:
+        self.artifact_meta(aid)
+        rows = self._q(
+            "SELECT * FROM artifact_docs WHERE artifact_id=? AND collection=? AND doc_id=?",
+            (aid, check_collection(collection), check_doc_id(doc_id)),
+        )
+        if not rows:
+            raise NotFound(f"no document {collection}/{doc_id}")
+        return self._doc_row(rows[0])
+
+    def _bump(self, db, aid: str) -> None:
+        db.execute(
+            "INSERT INTO artifact_db_rev(artifact_id, rev) VALUES(?, 1) ON CONFLICT(artifact_id) DO UPDATE SET rev=rev+1",
+            (aid,),
+        )
+
+    def db_write(
+        self, aid: str, collection: str, doc_id: str, data: Any, merge: bool = False, if_version: int | None = None
+    ) -> dict[str, Any]:
+        self.artifact_meta(aid)
+        check_collection(collection)
+        check_doc_id(doc_id)
+        if not isinstance(data, dict):
+            raise ValueError("a document must be a JSON object")
+        with self._tx() as db:
+            cur = db.execute(
+                "SELECT data, version FROM artifact_docs WHERE artifact_id=? AND collection=? AND doc_id=?",
+                (aid, collection, doc_id),
+            ).fetchone()
+            if if_version is not None and (cur["version"] if cur else 0) != if_version:
+                raise Conflict(f"{collection}/{doc_id} is at version {cur['version'] if cur else 0}, not {if_version}")
+            new = merge_doc(json.loads(cur["data"]), data) if (merge and cur) else (merge_doc({}, data) if merge else data)
+            text = json.dumps(new, ensure_ascii=False)
+            if len(text.encode()) > DOC_MAX_BYTES:
+                raise ValueError(f"document is larger than {DOC_MAX_BYTES} bytes")
+            version = (cur["version"] if cur else 0) + 1
+            t = now()
+            db.execute(
+                "INSERT INTO artifact_docs(artifact_id,collection,doc_id,data,version,updated_at) VALUES(?,?,?,?,?,?)"
+                " ON CONFLICT(artifact_id,collection,doc_id) DO UPDATE SET data=excluded.data, version=excluded.version,"
+                " updated_at=excluded.updated_at",
+                (aid, collection, doc_id, text, version, t),
+            )
+            self._bump(db, aid)
+        return {"id": doc_id, "data": new, "version": version, "updatedAt": t}
+
+    def db_delete(self, aid: str, collection: str, doc_id: str, if_version: int | None = None) -> None:
+        self.artifact_meta(aid)
+        check_collection(collection)
+        check_doc_id(doc_id)
+        with self._tx() as db:
+            cur = db.execute(
+                "SELECT version FROM artifact_docs WHERE artifact_id=? AND collection=? AND doc_id=?",
+                (aid, collection, doc_id),
+            ).fetchone()
+            if if_version is not None and (cur["version"] if cur else 0) != if_version:
+                raise Conflict(f"{collection}/{doc_id} is at version {cur['version'] if cur else 0}, not {if_version}")
+            db.execute(
+                "DELETE FROM artifact_docs WHERE artifact_id=? AND collection=? AND doc_id=?", (aid, collection, doc_id)
+            )
+            self._bump(db, aid)
 
     # ---- views ----------------------------------------------------------
     def state(self) -> dict[str, Any]:
