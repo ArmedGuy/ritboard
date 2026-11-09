@@ -152,7 +152,7 @@ def cmd_app(args) -> None:
         width=args.width,
         height=args.height,
         fullscreen=args.fullscreen,
-        background_color="#1b1d21",
+        background_color="#0f141b",
         text_select=True,
     )
     webview.start(private_mode=False)

@@ -60,9 +60,9 @@ The board is drawn at its set size and never reflows when the window changes. A 
 than the window pans; you can pan a little past each edge, where the darker hatched area
 shows you're off the board. Pan and zoom are per screen and remembered.
 
-Themes (Settings → This screen): green cutting mat (default), blue cutting mat, graphite,
-and paper. The mat has fine lines every 20 px, heavier ones every 100 px, and pixel numbers
-along the top and left edges. A board can still have its own background colour.
+Themes (Settings → This screen): dark blue-grey (default), black and light. The board has a
+cutting-mat grid: fine lines every 20 px, heavier ones every 100 px, and pixel numbers along
+the top and left edges. A board can still have its own background colour.
 
 With *1 board pixel = 1 device pixel* on (Settings → This screen), OS display scaling is
 cancelled out, so a 3840×2160 board fills a 4K panel exactly at 150% or 200% Windows scaling.

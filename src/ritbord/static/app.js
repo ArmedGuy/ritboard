@@ -82,7 +82,7 @@ const S = {
   pendingRefresh: false,
   editing: null,         // finding id, or 'new'
   space: false,
-  disp: Object.assign({ device: true, grid: true, snap: true, theme: 'mat' }, LS.get('display', {})),
+  disp: Object.assign({ device: true, grid: true, snap: true, theme: 'dark' }, LS.get('display', {})),
 };
 
 const by = {
@@ -398,7 +398,7 @@ function wrapHtml(content) {
   if (/<html|<body|<!doctype/i.test(content)) return content;
   const css = getComputedStyle(document.documentElement);
   const v = (n) => css.getPropertyValue(n).trim();
-  return `<!doctype html><meta charset="utf-8"><style>:root{color-scheme:${S.disp.theme === 'paper' ? 'light' : 'dark'}}`
+  return `<!doctype html><meta charset="utf-8"><style>:root{color-scheme:${S.disp.theme === 'light' ? 'light' : 'dark'}}`
     + `body{font:14px/1.5 system-ui,sans-serif;margin:12px;color:${v('--ink')};background:${v('--card')}}`
     + `svg text:not([fill]){fill:currentColor}a{color:${v('--a')}}table{border-collapse:collapse}td,th{border:1px solid ${v('--rule')};padding:4px 8px}</style>` + content;
 }
@@ -870,7 +870,7 @@ async function saveEditor(e) {
 function themeMat() {
   // The theme's mat colour as #rrggbb for the colour input.
   const c = getComputedStyle(document.documentElement).getPropertyValue('--mat').trim();
-  return /^#[0-9a-f]{6}$/i.test(c) ? c : '#1f3d32';
+  return /^#[0-9a-f]{6}$/i.test(c) ? c : '#121a23';
 }
 
 const PRESETS = [[1920, 1080], [2560, 1440], [3840, 2160], [5120, 2880], [7680, 2160], [7680, 4320], [11520, 2160]];
@@ -1044,7 +1044,11 @@ function wire() {
   wireSettings();
 }
 
-function applyTheme() { document.documentElement.dataset.theme = S.disp.theme || 'mat'; }
+const THEMES = ['dark', 'black', 'light'];
+function applyTheme() {
+  if (!THEMES.includes(S.disp.theme)) S.disp.theme = 'dark';
+  document.documentElement.dataset.theme = S.disp.theme;
+}
 
 async function main() {
   applyTheme();
