@@ -375,11 +375,11 @@ function artifactLabel(f) {
   return version ? `v${version} of ${a.latest} · pinned` : `artifact v${a.latest}`;
 }
 
-// Sites known to refuse being shown inside another page. Their cards get a button instead.
+// claude.ai links are refused when posted now; cards made before that show a note instead of a blank frame.
 function refusesFraming(url) {
   try {
     const u = new URL(url);
-    return /(^|\.)claude\.ai$/i.test(u.hostname);
+    return /(^|\.)claude\.(ai|site)$/i.test(u.hostname);
   } catch { return false; }
 }
 
@@ -437,9 +437,9 @@ function fillBody(body, f) {
     body.classList.add('framed');
     body.dataset.noframe = '1';
     body.append(h('div', { class: 'ph noframe' },
-      h('div', {}, 'claude.ai won’t show its pages inside another site.'),
+      h('div', {}, 'This is a claude.ai link, which can’t be shown inside Ritboard.'),
       h('a', { href: f.content, target: '_blank', rel: 'noopener noreferrer' }, 'Open in a new window ↗'),
-      h('small', {}, 'To show a Claude artifact here, publish its HTML as a Ritboard artifact.')));
+      h('small', {}, 'Ask the agent that posted it to publish the HTML as a Ritboard artifact.')));
   } else {
     body.classList.add('framed');
     body.append(h('div', { class: 'ph' }, f.kind === 'url' ? (f.content || 'No URL') : f.title));
@@ -920,7 +920,7 @@ const HINTS = {
   csv: 'First row is the header. Comma, semicolon, tab or | separated.',
   html: 'A one-off HTML snippet or document, stored in the card. Runs sandboxed with scripts allowed. For anything you will revise, use Artifact.',
   artifact: 'A page kept as an artifact: every save is a new version, it has its own address (↗), and every card showing it reloads. Scripts run sandboxed.',
-  url: 'A page to frame. Many sites refuse framing; claude.ai always does. To show a Claude artifact, publish its HTML as an Artifact.',
+  url: 'An external page to frame. Many sites refuse framing. claude.ai links are not accepted; make an Artifact with the HTML instead.',
   image: 'An image URL or a data: URI.',
   folder: 'Groups findings in the tree. Placed on a board it lists its children.',
 };

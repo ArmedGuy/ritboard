@@ -143,6 +143,19 @@ def content_type(path: str) -> str:
     return ct
 
 
+CLAUDE_LINK = re.compile(r"^https?://([^/]*\.)?(claude\.ai|claude\.site)(:\d+)?(/|$)", re.I)
+CLAUDE_LINK_ERROR = (
+    "Ritboard does not show claude.ai artifacts: claude.ai refuses to be framed, so the card stays blank. "
+    "Publish the artifact's HTML here instead with publish_artifact (html=... for one page, or files=[...]); "
+    "it gets its own address and versions, and every card showing it reloads when you update it."
+)
+
+
+def check_not_claude_link(kind: str, content: str) -> None:
+    if kind == "url" and CLAUDE_LINK.match((content or "").strip()):
+        raise ValueError(CLAUDE_LINK_ERROR)
+
+
 def parse_artifact_ref(ref: str) -> tuple[str, int | None]:
     """'a_xxx' -> latest; 'a_xxx@3' -> version 3."""
     aid, _, ver = (ref or "").strip().partition("@")
@@ -338,6 +351,7 @@ class WorkspaceStore:
         self._check_parent(None, parent_id)
         if kind == "artifact":
             content = self._check_artifact_ref(content)
+        check_not_claude_link(kind, content)
         fid = new_id("f")
         t = now()
         with self._tx() as db:
@@ -407,6 +421,8 @@ class WorkspaceStore:
                 )[0]["m"]
         if sets.get("kind", cur["kind"]) == "artifact" and ("kind" in sets or "content" in sets):
             sets["content"] = self._check_artifact_ref(sets.get("content", cur["content"]))
+        if "kind" in sets or "content" in sets:
+            check_not_claude_link(sets.get("kind", cur["kind"]), sets.get("content", cur["content"]))
         if "kind" in sets or "content" in sets:
             sets["rendered"] = render(sets.get("kind", cur["kind"]), sets.get("content", cur["content"]))
         if not sets:

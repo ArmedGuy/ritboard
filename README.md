@@ -126,9 +126,10 @@ scripts, styles, data and images. Every publish is a numbered version, kept whol
   ＋ Finding → kind Artifact, edit its `index.html` from the card, and manage them in the
   Artifacts tab, where you can drag one onto the board.
 
-claude.ai refuses to be framed by other sites, so a `url` card pointing at claude.ai shows an
-Open button instead. To show a Claude artifact on the board, publish its HTML as a Ritboard
-artifact.
+Claude artifacts (claude.ai links) are not supported: claude.ai refuses to be shown inside
+other pages. Ritboard rejects `url` cards that point at claude.ai or claude.site with a
+message telling the agent to publish the HTML as a Ritboard artifact instead. Older cards
+like that show a note and an Open link.
 
 ## Service
 

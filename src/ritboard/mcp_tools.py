@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import base64
+import functools
 from typing import Any
 
 from mcp.server.mcpserver import MCPServer
+from mcp.server.mcpserver.exceptions import ToolError
 from pydantic import BaseModel, Field
 
 from .store import Registry
@@ -26,8 +28,12 @@ Model:
   page, app, chart or report worth revising; update_artifact makes a new version and every
   card showing it reloads. Relative links between its files work. Pages run sandboxed: no
   access to Ritboard's API, no cookies or localStorage; libraries from CDNs load normally.
-  To bring over a Claude artifact, read its HTML and publish it here (claude.ai pages
-  refuse to be framed, so a url card to claude.ai only shows an Open button).
+- Never post claude.ai or claude.site links (Claude artifacts) as url cards; they are refused,
+  because claude.ai can't be shown inside another page. Publish the artifact's HTML with
+  publish_artifact instead: get the HTML (from your own output, or by reading the artifact)
+  and pass it as html=... or as files. To fix an existing claude.ai card, publish the HTML,
+  then update_finding that card to kind="artifact", content=<new artifact id>; it keeps its
+  place on the boards.
 - A board is a tab with a fixed pixel size (e.g. 3840x2160). A finding only shows on a board
   once placed there. Coordinates are exact board pixels, origin top-left. Leave x/y out and
   Ritboard picks a free spot.
@@ -77,6 +83,19 @@ def _decode(files: list[ArtifactFile] | None, html: str | None) -> dict[str, byt
 def build_mcp(reg: Registry, ui_state: dict[str, Any], base_url: str = "") -> MCPServer:
     mcp = MCPServer("ritboard", title="Ritboard", instructions=INSTRUCTIONS)
 
+    def tool(fn):
+        """Register a tool. Bad input and missing ids come back to the agent as readable errors
+        (the SDK hides the text of other exceptions)."""
+
+        @functools.wraps(fn)
+        async def wrapper(*args, **kwargs):
+            try:
+                return await fn(*args, **kwargs)
+            except (ValueError, LookupError) as e:
+                raise ToolError(str(e)) from e
+
+        return mcp.tool()(wrapper)
+
     def art_url(ws: str, aid: str, version: int | None = None) -> str:
         return f"{base_url}/w/{ws}/a/{aid}{'@' + str(version) if version else ''}/"
 
@@ -117,23 +136,23 @@ def build_mcp(reg: Registry, ui_state: dict[str, Any], base_url: str = "") -> MC
         }
 
     # ---- workspaces -----------------------------------------------------
-    @mcp.tool()
+    @tool
     async def list_workspaces() -> dict[str, Any]:
         """List all workspaces (projects) with their ids and counts."""
         return {"workspaces": reg.list(), "on_screen": ui_state.get("workspace")}
 
-    @mcp.tool()
+    @tool
     async def current_workspace() -> dict[str, Any]:
         """The workspace and board currently open on screen, if any browser has reported one."""
         return {"workspace": ui_state.get("workspace"), "board_id": ui_state.get("board")}
 
-    @mcp.tool()
+    @tool
     async def create_workspace(name: str, first_board_name: str = "Main") -> dict[str, Any]:
         """Create a new workspace (project). It starts with one board."""
         st = reg.create(name, first_board_name or None)
         return _overview(st.id)
 
-    @mcp.tool()
+    @tool
     async def update_workspace(
         workspace: str,
         name: str | None = None,
@@ -159,13 +178,13 @@ def build_mcp(reg: Registry, ui_state: dict[str, Any], base_url: str = "") -> MC
             st.update_settings(patch)
         return {"workspace": st.summary(), "settings": st.settings()}
 
-    @mcp.tool()
+    @tool
     async def get_overview(workspace: str) -> dict[str, Any]:
         """Boards, categories and the full findings tree (without content) for a workspace."""
         return _overview(workspace)
 
     # ---- findings -------------------------------------------------------
-    @mcp.tool()
+    @tool
     async def list_findings(
         workspace: str,
         category: str | None = None,
@@ -180,7 +199,7 @@ def build_mcp(reg: Registry, ui_state: dict[str, Any], base_url: str = "") -> MC
             f.pop("rendered", None)
         return {"findings": fs}
 
-    @mcp.tool()
+    @tool
     async def get_finding(workspace: str, finding_id: str) -> dict[str, Any]:
         """One finding with its full content and the boards it is placed on."""
         st = reg.get(workspace)
@@ -189,7 +208,7 @@ def build_mcp(reg: Registry, ui_state: dict[str, Any], base_url: str = "") -> MC
         f["on_boards"] = [p for p in st.placements() if p["finding_id"] == finding_id]
         return f
 
-    @mcp.tool()
+    @tool
     async def add_finding(
         workspace: str,
         title: str,
@@ -206,7 +225,8 @@ def build_mcp(reg: Registry, ui_state: dict[str, Any], base_url: str = "") -> MC
         h: int | None = None,
     ) -> dict[str, Any]:
         """Add a finding to the workspace tree. Give board_id to also place it on a board
-        (x/y optional; omitted means auto-place). `source` names who posted it."""
+        (x/y optional; omitted means auto-place). `source` names who posted it.
+        For a page, app or chart, use publish_artifact instead; claude.ai links are refused."""
         st = reg.get(workspace)
         f = st.add_finding(title, content, kind, parent_id, category, tags, source)
         f.pop("rendered", None)
@@ -214,7 +234,7 @@ def build_mcp(reg: Registry, ui_state: dict[str, Any], base_url: str = "") -> MC
             f["placement"] = st.place(board_id, [{"finding_id": f["id"], "x": x, "y": y, "w": w, "h": h}])[0]
         return f
 
-    @mcp.tool()
+    @tool
     async def add_findings(
         workspace: str, findings: list[FindingIn], source: str | None = None, board_id: str | None = None
     ) -> dict[str, Any]:
@@ -228,7 +248,7 @@ def build_mcp(reg: Registry, ui_state: dict[str, Any], base_url: str = "") -> MC
             st.place(board_id, [{"finding_id": f["id"]} for f in out])
         return {"added": out}
 
-    @mcp.tool()
+    @tool
     async def update_finding(
         workspace: str,
         finding_id: str,
@@ -251,21 +271,21 @@ def build_mcp(reg: Registry, ui_state: dict[str, Any], base_url: str = "") -> MC
         f.pop("rendered", None)
         return f
 
-    @mcp.tool()
+    @tool
     async def delete_finding(workspace: str, finding_id: str, recursive: bool = False) -> dict[str, Any]:
         """Delete a finding from the workspace and every board. Children move up a level
         unless recursive is true, in which case they are deleted too."""
         return reg.get(workspace).delete_finding(finding_id, recursive)
 
     # ---- boards ---------------------------------------------------------
-    @mcp.tool()
+    @tool
     async def create_board(
         workspace: str, name: str, width: int | None = None, height: int | None = None, background: str | None = None
     ) -> dict[str, Any]:
         """Create a board tab. Size defaults to the workspace default (pixels)."""
         return reg.get(workspace).create_board(name, width, height, background)
 
-    @mcp.tool()
+    @tool
     async def update_board(
         workspace: str,
         board_id: str,
@@ -282,18 +302,18 @@ def build_mcp(reg: Registry, ui_state: dict[str, Any], base_url: str = "") -> MC
         st.update_board(board_id, **kw)
         return st.board_view(board_id)
 
-    @mcp.tool()
+    @tool
     async def delete_board(workspace: str, board_id: str) -> dict[str, Any]:
         """Delete a board tab. Findings stay in the workspace tree."""
         reg.get(workspace).delete_board(board_id)
         return {"deleted": board_id}
 
-    @mcp.tool()
+    @tool
     async def get_board(workspace: str, board_id: str) -> dict[str, Any]:
         """A board with every placement (pixel geometry, title, out-of-bounds flag)."""
         return reg.get(workspace).board_view(board_id)
 
-    @mcp.tool()
+    @tool
     async def place_findings(workspace: str, board_id: str, placements: list[PlacementIn]) -> dict[str, Any]:
         """Put findings on a board or move/resize ones already there.
         Fields left out keep their current value; a new card without x/y is auto-placed."""
@@ -301,13 +321,13 @@ def build_mcp(reg: Registry, ui_state: dict[str, Any], base_url: str = "") -> MC
         st.place(board_id, [p.model_dump() for p in placements])
         return st.board_view(board_id)
 
-    @mcp.tool()
+    @tool
     async def remove_from_board(workspace: str, board_id: str, finding_ids: list[str]) -> dict[str, Any]:
         """Take findings off a board. They stay in the workspace tree."""
         return {"removed": reg.get(workspace).unplace(board_id, finding_ids)}
 
     # ---- artifacts ------------------------------------------------------
-    @mcp.tool()
+    @tool
     async def publish_artifact(
         workspace: str,
         title: str,
@@ -339,7 +359,7 @@ def build_mcp(reg: Registry, ui_state: dict[str, Any], base_url: str = "") -> MC
                 out["placement"] = st.place(board_id, [{"finding_id": f["id"], "x": x, "y": y, "w": w, "h": h}])[0]
         return out
 
-    @mcp.tool()
+    @tool
     async def update_artifact(
         workspace: str,
         artifact_id: str,
@@ -359,7 +379,7 @@ def build_mcp(reg: Registry, ui_state: dict[str, Any], base_url: str = "") -> MC
         a = st.update_artifact(artifact_id, _decode(files, html), remove, note, title, description, entry, source)
         return art_out(st.id, a)
 
-    @mcp.tool()
+    @tool
     async def get_artifact(
         workspace: str, artifact_id: str, version: int | None = None, include_content: bool = True
     ) -> dict[str, Any]:
@@ -369,13 +389,13 @@ def build_mcp(reg: Registry, ui_state: dict[str, Any], base_url: str = "") -> MC
         a = st.get_artifact(artifact_id, version, include_content)
         return {**art_out(st.id, a), "versions": a["versions"]}
 
-    @mcp.tool()
+    @tool
     async def list_artifacts(workspace: str) -> dict[str, Any]:
         """All artifacts in a workspace: id, title, latest version, file count, size, address."""
         st = reg.get(workspace)
         return {"artifacts": [art_out(st.id, a) for a in st.list_artifacts()]}
 
-    @mcp.tool()
+    @tool
     async def delete_artifact(workspace: str, artifact_id: str) -> dict[str, Any]:
         """Delete an artifact with all its versions, and the cards that show it."""
         return reg.get(workspace).delete_artifact(artifact_id)

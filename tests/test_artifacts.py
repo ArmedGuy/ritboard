@@ -83,3 +83,21 @@ def test_artifact_from_ui_api(server):  # noqa: F811
     assert pinned.status_code == 200
     bad = httpx.post(f"{server}/api/w/{ws}/findings", json={"title": "Bad", "kind": "artifact", "content": f"{aid}@9"})
     assert bad.status_code == 400
+
+
+def test_claude_links_are_refused(server):  # noqa: F811
+    async def run():
+        async with Client(server + "/mcp") as c:
+            ws = data(await c.call_tool("create_workspace", {"name": "No Claude links"}))["workspace"]["id"]
+            for url in ("https://claude.ai/artifact/abc", "https://claude.site/public/artifacts/x/embed"):
+                r = await c.call_tool("add_finding", {"workspace": ws, "title": "x", "kind": "url", "content": url})
+                assert r.is_error and "publish_artifact" in r.content[0].text
+            ok = data(await c.call_tool("add_finding", {"workspace": ws, "title": "x", "kind": "url", "content": "https://example.com"}))
+            r = await c.call_tool("update_finding", {"workspace": ws, "finding_id": ok["id"], "content": "https://claude.ai/x"})
+            assert r.is_error
+            pub = data(await c.call_tool("publish_artifact", {"workspace": ws, "title": "p", "html": "<p>hi</p>", "add_card": False}))
+            moved = data(await c.call_tool("update_finding", {
+                "workspace": ws, "finding_id": ok["id"], "kind": "artifact", "content": pub["artifact"]["id"]}))
+            assert moved["kind"] == "artifact"
+
+    asyncio.run(run())
