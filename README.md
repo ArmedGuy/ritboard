@@ -207,3 +207,7 @@ uv run pytest
 ```
 
 The UI is plain JavaScript in `src/ritboard/static/`, no build step.
+
+## License
+
+MIT. See [LICENSE](LICENSE).
