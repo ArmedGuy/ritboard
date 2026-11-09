@@ -1,7 +1,7 @@
 [project]
-name = "ritbord"
+name = "ritboard"
 version = "0.1.0"
-description = "Big-screen planning board where agents post, sort and link findings over MCP"
+description = "Big-screen planning board where agents post, sort and arrange findings and artifacts over MCP"
 readme = "README.md"
 authors = [{ name = "Johan" }]
 requires-python = ">=3.11"
@@ -14,11 +14,11 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-# Native window instead of a browser tab: `uv run --extra desktop ritbord app`
+# Native window instead of a browser tab: `uv run --extra desktop ritboard app`
 desktop = ["pywebview>=5.4"]
 
 [project.scripts]
-ritbord = "ritbord.cli:main"
+ritboard = "ritboard.cli:main"
 
 [build-system]
 requires = ["uv_build>=0.11.32,<0.12.0"]

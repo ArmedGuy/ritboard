@@ -6,12 +6,13 @@ import asyncio
 import contextlib
 import hmac
 import json
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
 from fastapi import Body, FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, RedirectResponse, Response
 from fastapi.staticfiles import StaticFiles
 from mcp.server.transport_security import TransportSecuritySettings
 from pydantic import BaseModel
@@ -20,9 +21,16 @@ from starlette.types import ASGIApp, Receive, Scope, Send
 from . import __version__
 from .hub import Hub
 from .mcp_tools import build_mcp
-from .store import NotFound, Registry
+from .store import NotFound, Registry, parse_artifact_ref
 
 STATIC = Path(__file__).parent / "static"
+ARTIFACT_PATH = re.compile(r"^/w/[^/]+/a/")
+# Served artifact pages get a throwaway origin even when opened full-window, so their
+# scripts can't call Ritboard's API. allow-same-origin is deliberately absent.
+ARTIFACT_CSP = (
+    "sandbox allow-scripts allow-forms allow-popups allow-popups-to-escape-sandbox "
+    "allow-modals allow-downloads allow-presentation"
+)
 LOCAL_HOSTS = ("127.0.0.1", "localhost", "::1")
 
 
@@ -53,7 +61,7 @@ async def _watch_static(hub: Hub) -> None:
 
 
 def _write_beacon(cfg: Config) -> Path:
-    """Leave the running server's address in the data folder so `ritbord mcp` finds it
+    """Leave the running server's address in the data folder so `ritboard mcp` finds it
     without being told the port."""
     import os
 
@@ -72,12 +80,12 @@ def app_from_env():
 
     return create_app(
         Config(
-            data_dir=Path(os.environ["RITBORD_DATA"]),
-            host=os.environ.get("RITBORD_HOST", "127.0.0.1"),
-            port=int(os.environ.get("RITBORD_PORT", "8765")),
-            token=os.environ.get("RITBORD_TOKEN") or None,
-            allowed_hosts=[h for h in os.environ.get("RITBORD_ALLOWED_HOSTS", "").split(",") if h],
-            dev=os.environ.get("RITBORD_DEV") == "1",
+            data_dir=Path(os.environ["RITBOARD_DATA"]),
+            host=os.environ.get("RITBOARD_HOST", "127.0.0.1"),
+            port=int(os.environ.get("RITBOARD_PORT", "8765")),
+            token=os.environ.get("RITBOARD_TOKEN") or None,
+            allowed_hosts=[h for h in os.environ.get("RITBOARD_ALLOWED_HOSTS", "").split(",") if h],
+            dev=os.environ.get("RITBOARD_DEV") == "1",
         )
     )
 
@@ -118,6 +126,29 @@ class PlacementItem(BaseModel):
     z: int | None = None
 
 
+class ArtifactCreate(BaseModel):
+    title: str
+    files: dict[str, str]
+    entry: str = "index.html"
+    description: str = ""
+    source: str | None = None
+    add_card: bool = True
+    parent_id: str | None = None
+    category: str | None = None
+    tags: list[str] | None = None
+    board_id: str | None = None
+
+
+class ArtifactUpdate(BaseModel):
+    files: dict[str, str] = {}
+    remove: list[str] | None = None
+    note: str = ""
+    title: str | None = None
+    description: str | None = None
+    entry: str | None = None
+    source: str | None = None
+
+
 class TokenGate:
     """Optional shared-token check for LAN use. Accepts a Bearer header, a cookie,
     or ?token= (which also sets the cookie so the browser UI keeps working)."""
@@ -129,6 +160,10 @@ class TokenGate:
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
         if not self.token or scope["type"] not in ("http", "websocket"):
             return await self.app(scope, receive, send)
+        # Artifact pages run in a sandbox with an opaque origin, so their requests carry no
+        # cookie. They stay reachable without the token; their long random ids are the key.
+        if scope["type"] == "http" and ARTIFACT_PATH.match(scope.get("path", "")):
+            return await self.app(scope, receive, send)
         headers = {k.decode().lower(): v.decode() for k, v in scope.get("headers", [])}
         given = None
         auth = headers.get("authorization", "")
@@ -137,7 +172,7 @@ class TokenGate:
         if not given:
             for part in headers.get("cookie", "").split(";"):
                 k, _, v = part.strip().partition("=")
-                if k == "ritbord_token":
+                if k == "ritboard_token":
                     given = v
         from_query = False
         if not given:
@@ -151,7 +186,7 @@ class TokenGate:
                 async def send_with_cookie(msg):
                     if msg["type"] == "http.response.start":
                         msg.setdefault("headers", []).append(
-                            (b"set-cookie", f"ritbord_token={self.token}; Path=/; HttpOnly; SameSite=Strict".encode())
+                            (b"set-cookie", f"ritboard_token={self.token}; Path=/; HttpOnly; SameSite=Strict".encode())
                         )
                     await send(msg)
 
@@ -173,7 +208,8 @@ def create_app(cfg: Config) -> FastAPI:
     if not reg.ids():
         reg.create("Scratch")
 
-    mcp = build_mcp(reg, ui_state)
+    shown_host = "127.0.0.1" if cfg.host in ("0.0.0.0", "", "::") else cfg.host
+    mcp = build_mcp(reg, ui_state, base_url=f"http://{shown_host}:{cfg.port}")
     if cfg.host in LOCAL_HOSTS and not cfg.allowed_hosts:
         security = None  # SDK default: DNS rebinding protection for localhost
     elif cfg.allowed_hosts:
@@ -207,7 +243,7 @@ def create_app(cfg: Config) -> FastAPI:
                 beacon.unlink()
             reg.close()
 
-    app = FastAPI(title="Ritbord", version=__version__, lifespan=lifespan, docs_url="/api/docs", openapi_url="/api/openapi.json")
+    app = FastAPI(title="Ritboard", version=__version__, lifespan=lifespan, docs_url="/api/docs", openapi_url="/api/openapi.json")
     app.state.registry = reg
     app.state.hub = hub
     app.state.ui = ui_state
@@ -296,6 +332,58 @@ def create_app(cfg: Config) -> FastAPI:
     @app.post("/api/w/{ws}/boards/{bid}/unplace")
     async def unplace(ws: str, bid: str, finding_ids: list[str] = Body(...)):
         return {"removed": reg.get(ws).unplace(bid, finding_ids)}
+
+    # ---- artifacts ----------------------------------------------------
+    @app.get("/api/w/{ws}/artifacts")
+    async def list_artifacts(ws: str):
+        return reg.get(ws).list_artifacts()
+
+    @app.get("/api/w/{ws}/artifacts/{aid}")
+    async def get_artifact(ws: str, aid: str, version: int | None = None, content: bool = False):
+        return reg.get(ws).get_artifact(aid, version, content)
+
+    @app.post("/api/w/{ws}/artifacts")
+    async def create_artifact(ws: str, body: ArtifactCreate):
+        st = reg.get(ws)
+        a = st.create_artifact(body.title, {p: c.encode() for p, c in body.files.items()}, body.entry, body.description, body.source)
+        out: dict[str, Any] = {"artifact": a}
+        if body.add_card:
+            f = st.add_finding(body.title, a["id"], "artifact", body.parent_id, body.category, body.tags, body.source)
+            out["finding"] = f
+            if body.board_id:
+                out["placement"] = st.place(body.board_id, [{"finding_id": f["id"]}])[0]
+        return out
+
+    @app.post("/api/w/{ws}/artifacts/{aid}/versions")
+    async def new_version(ws: str, aid: str, body: ArtifactUpdate):
+        return reg.get(ws).update_artifact(
+            aid, {p: c.encode() for p, c in body.files.items()}, body.remove, body.note,
+            body.title, body.description, body.entry, body.source,
+        )
+
+    @app.delete("/api/w/{ws}/artifacts/{aid}")
+    async def delete_artifact(ws: str, aid: str):
+        return reg.get(ws).delete_artifact(aid)
+
+    @app.get("/w/{ws}/a/{ref}")
+    async def artifact_root(ws: str, ref: str):
+        # Relative links inside the artifact need the trailing slash.
+        return RedirectResponse(f"/w/{ws}/a/{ref}/", status_code=308)
+
+    @app.get("/w/{ws}/a/{ref}/{path:path}")
+    async def artifact_file(ws: str, ref: str, path: str):
+        aid, version = parse_artifact_ref(ref)
+        try:
+            data, ctype = reg.get(ws).artifact_file(aid, version, path)
+        except NotFound as e:
+            return Response(str(e), status_code=404, media_type="text/plain", headers={"Content-Security-Policy": ARTIFACT_CSP})
+        headers = {
+            "Content-Security-Policy": ARTIFACT_CSP,
+            "Access-Control-Allow-Origin": "*",  # the sandboxed page fetches its own files from an opaque origin
+            "X-Content-Type-Options": "nosniff",
+            "Cache-Control": "public, max-age=31536000, immutable" if version else "no-cache",
+        }
+        return Response(data, media_type=ctype, headers=headers)
 
     # ---- live updates -------------------------------------------------
     @app.websocket("/ws")

@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Ritbord</title>
+<title>Ritboard</title>
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect x='3' y='5' width='26' height='20' rx='2' fill='%23ecebe6' stroke='%232b2e33' stroke-width='2'/%3E%3Crect x='7' y='9' width='8' height='6' fill='%2300798c'/%3E%3Crect x='18' y='14' width='7' height='7' fill='%23d1495b'/%3E%3Cpath d='M15 12 L18 17' stroke='%232b2e33' stroke-width='1.5'/%3E%3C/svg%3E">
 <link rel="stylesheet" href="/static/style.css">
 </head>
@@ -37,6 +37,7 @@
     <button data-tab="tree" class="on">Findings</button>
     <button data-tab="cats">Categories</button>
     <button data-tab="board">On board</button>
+    <button data-tab="arts">Artifacts</button>
   </div>
   <input id="side-search" type="search" placeholder="Filter">
   <div id="side-body"></div>
@@ -59,7 +60,8 @@
           <option value="md">Markdown</option>
           <option value="text">Plain text</option>
           <option value="csv">Table (CSV)</option>
-          <option value="html">HTML document</option>
+          <option value="artifact">Artifact (page with versions)</option>
+          <option value="html">HTML snippet</option>
           <option value="url">Web page (URL)</option>
           <option value="image">Image</option>
           <option value="folder">Folder</option>
@@ -70,6 +72,7 @@
     <label>Tags <input name="tags" placeholder="comma separated"></label>
     <label id="ed-content-label">Content <textarea name="content" spellcheck="false"></textarea></label>
     <p class="hint" id="ed-hint"></p>
+    <p class="hint" id="ed-art"></p>
     <p class="meta" id="ed-meta"></p>
     <label class="check" id="ed-place-wrap"><input type="checkbox" name="place" checked> Place on current board</label>
     <div class="ed-actions">

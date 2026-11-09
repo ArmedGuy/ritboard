@@ -1,6 +1,6 @@
 import pytest
 
-from ritbord.store import NotFound, Registry
+from ritboard.store import NotFound, Registry
 
 
 @pytest.fixture

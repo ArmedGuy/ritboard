@@ -1,4 +1,4 @@
-"""Add (or update) the Ritbord entry in Claude Desktop's MCP config.
+"""Add (or update) the Ritboard entry in Claude Desktop's MCP config.
 
     uv run python scripts/add_to_claude_desktop.py
 
@@ -26,7 +26,7 @@ def main() -> None:
     uv = shutil.which("uv")
     if not uv:
         sys.exit("uv not found on PATH")
-    entry = {"command": uv, "args": ["--directory", str(project), "run", "ritbord", "mcp"]}
+    entry = {"command": uv, "args": ["--directory", str(project), "run", "ritboard", "mcp"]}
 
     path = config_path()
     cfg = {}
@@ -38,14 +38,16 @@ def main() -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
 
     servers = cfg.setdefault("mcpServers", {})
-    old = servers.get("ritbord")
-    servers["ritbord"] = entry
+    old = servers.get("ritboard")
+    servers["ritboard"] = entry
+    if servers.pop("ritbord", None) is not None:  # the entry from before the rename
+        print("Removed the old 'ritbord' entry")
     path.write_text(json.dumps(cfg, indent=2) + "\n", encoding="utf-8")
 
-    print(("Updated" if old else "Added") + f" 'ritbord' in {path}")
+    print(("Updated" if old else "Added") + f" 'ritboard' in {path}")
     print(f"  command: {uv}")
     print(f"  args:    {' '.join(entry['args'])}")
-    others = [k for k in servers if k != "ritbord"]
+    others = [k for k in servers if k != "ritboard"]
     if others:
         print(f"Kept: {', '.join(others)}")
     print("Quit Claude Desktop fully and start it again to load it.")

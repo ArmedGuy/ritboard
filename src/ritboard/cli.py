@@ -1,4 +1,4 @@
-"""Command line: `ritbord serve` runs the service, `ritbord app` opens a native window."""
+"""Command line: `ritboard serve` runs the service, `ritboard app` opens a native window."""
 
 from __future__ import annotations
 
@@ -15,17 +15,34 @@ from pathlib import Path
 from platformdirs import user_data_dir
 
 
+# Environment variables from before the rename (RITBORD_*) still work.
+for _k, _v in list(os.environ.items()):
+    if _k.startswith("RITBORD_"):
+        os.environ.setdefault("RITBOARD_" + _k[len("RITBORD_"):], _v)
+
+
 def default_data_dir() -> Path:
-    return Path(os.environ.get("RITBORD_DATA") or user_data_dir("ritbord", appauthor=False))
+    if os.environ.get("RITBOARD_DATA"):
+        return Path(os.environ["RITBOARD_DATA"])
+    new = Path(user_data_dir("ritboard", appauthor=False))
+    old = Path(user_data_dir("ritbord", appauthor=False))  # name before the rename
+    if old.is_dir() and not new.exists():
+        try:
+            old.rename(new)
+            print(f"Moved data from {old} to {new}", file=sys.stderr)
+        except OSError as e:  # e.g. an old server still has the files open
+            print(f"Using {old}; could not move it to {new} ({e.strerror or e})", file=sys.stderr)
+            return old
+    return new
 
 
 def _serve_args(p: argparse.ArgumentParser, default_host: str = "127.0.0.1", default_port: int = 8765) -> None:
-    p.add_argument("--host", default=os.environ.get("RITBORD_HOST", default_host))
-    p.add_argument("--port", type=int, default=int(os.environ.get("RITBORD_PORT", default_port)))
+    p.add_argument("--host", default=os.environ.get("RITBOARD_HOST", default_host))
+    p.add_argument("--port", type=int, default=int(os.environ.get("RITBOARD_PORT", default_port)))
     p.add_argument("--data", type=Path, default=default_data_dir(), help="data folder (default: %(default)s)")
     p.add_argument(
         "--token",
-        default=os.environ.get("RITBORD_TOKEN"),
+        default=os.environ.get("RITBOARD_TOKEN"),
         help="require this token for the API, MCP and UI (use when listening beyond localhost)",
     )
     p.add_argument(
@@ -72,19 +89,19 @@ def cmd_serve(args) -> None:
 
     if args.host not in ("127.0.0.1", "localhost", "::1") and not args.token:
         print("warning: listening beyond localhost without --token; anyone on the network can edit boards", file=sys.stderr)
-    print(f"Ritbord on http://{args.host}:{args.port}  MCP: http://{args.host}:{args.port}/mcp  data: {args.data}")
+    print(f"Ritboard on http://{args.host}:{args.port}  MCP: http://{args.host}:{args.port}/mcp  data: {args.data}")
     if args.dev:
         # Restart on Python changes; open browsers reload on UI changes.
         os.environ.update(
-            RITBORD_DATA=str(args.data),
-            RITBORD_HOST=args.host,
-            RITBORD_PORT=str(args.port),
-            RITBORD_TOKEN=args.token or "",
-            RITBORD_ALLOWED_HOSTS=",".join(args.allowed_hosts),
-            RITBORD_DEV="1",
+            RITBOARD_DATA=str(args.data),
+            RITBOARD_HOST=args.host,
+            RITBOARD_PORT=str(args.port),
+            RITBOARD_TOKEN=args.token or "",
+            RITBOARD_ALLOWED_HOSTS=",".join(args.allowed_hosts),
+            RITBOARD_DEV="1",
         )
         uvicorn.run(
-            "ritbord.server:app_from_env",
+            "ritboard.server:app_from_env",
             factory=True,
             host=args.host,
             port=args.port,
@@ -120,7 +137,7 @@ def cmd_app(args) -> None:
     try:
         import webview  # pywebview
     except ImportError:
-        raise SystemExit("Desktop mode needs pywebview: uv sync --extra desktop  (or: uv tool install 'ritbord[desktop]')")
+        raise SystemExit("Desktop mode needs pywebview: uv sync --extra desktop  (or: uv tool install 'ritboard[desktop]')")
 
     if not args.url and args.port:
         # A service already running on this port? Use it instead of starting a second one.
@@ -142,12 +159,12 @@ def cmd_app(args) -> None:
         server = uvicorn.Server(uvicorn.Config(app, host=args.host, port=args.port, log_level="warning"))
         threading.Thread(target=server.run, daemon=True).start()
         url = f"http://{args.host}:{args.port}"
-        print(f"Ritbord on {url}  MCP: {url}/mcp")
+        print(f"Ritboard on {url}  MCP: {url}/mcp")
     _wait_up(url)
     if args.token:
         url += f"/?token={args.token}"
     webview.create_window(
-        "Ritbord",
+        "Ritboard",
         url,
         width=args.width,
         height=args.height,
@@ -172,13 +189,13 @@ def cmd_mcp(args) -> None:
             info = json.loads((args.data / "server.json").read_text())
             return info["url"], info.get("token")
         except (OSError, ValueError, KeyError):
-            return f"http://127.0.0.1:{os.environ.get('RITBORD_PORT', 8765)}", None
+            return f"http://127.0.0.1:{os.environ.get('RITBOARD_PORT', 8765)}", None
 
     asyncio.run(run_bridge(url, token, locate=None if url else locate))
 
 
 def main(argv: list[str] | None = None) -> None:
-    ap = argparse.ArgumentParser(prog="ritbord", description="Big-screen planning board with an MCP endpoint")
+    ap = argparse.ArgumentParser(prog="ritboard", description="Big-screen planning board with an MCP endpoint")
     sub = ap.add_subparsers(dest="cmd")
 
     s = sub.add_parser("serve", help="run the server (for a service or a browser)")
@@ -195,13 +212,13 @@ def main(argv: list[str] | None = None) -> None:
     a.add_argument("--height", type=int, default=1000)
     a.set_defaults(func=cmd_app)
 
-    m = sub.add_parser("mcp", help="stdio MCP server that forwards to a running Ritbord (for Claude Desktop)")
+    m = sub.add_parser("mcp", help="stdio MCP server that forwards to a running Ritboard (for Claude Desktop)")
     m.add_argument(
         "--url",
-        default=os.environ.get("RITBORD_URL"),
+        default=os.environ.get("RITBOARD_URL"),
         help="address of the running server (default: found via <data>/server.json)",
     )
-    m.add_argument("--token", default=os.environ.get("RITBORD_TOKEN"))
+    m.add_argument("--token", default=os.environ.get("RITBOARD_TOKEN"))
     m.add_argument("--data", type=Path, default=default_data_dir(), help="data folder of the server to find")
     m.set_defaults(func=cmd_mcp)
 

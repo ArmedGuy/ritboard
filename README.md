@@ -1,4 +1,4 @@
-# Ritbord
+# Ritboard
 
 A planning board for big screens. Agents post findings over MCP, sort them into a tree,
 and put them on boards at exact pixel positions. You arrange and edit the same board in a
@@ -8,23 +8,23 @@ browser or a native window. Changes show up live everywhere.
 
 ```sh
 uv sync
-uv run ritbord serve                 # http://127.0.0.1:8765, MCP at /mcp
+uv run ritboard serve                 # http://127.0.0.1:8765, MCP at /mcp
 uv run python scripts/demo_seed.py   # optional: a demo workspace, written over MCP
 ```
 
-While working on Ritbord itself, `uv run ritbord serve --dev` restarts on Python changes and
+While working on Ritboard itself, `uv run ritboard serve --dev` restarts on Python changes and
 reloads open browsers when the UI files change.
 
 On Windows, error 10013 on start means the port is in a range Hyper-V or WSL reserved.
 `netsh interface ipv4 show excludedportrange protocol=tcp` lists them; pick another `--port`
-(or set `RITBORD_PORT`).
+(or set `RITBOARD_PORT`).
 
 Native window instead of a browser tab (uses the system webview, not a bundled Chromium):
 
 ```sh
 uv sync --extra desktop
-uv run ritbord app                        # starts its own server
-uv run ritbord app --url http://127.0.0.1:8765 --fullscreen   # window onto a running service
+uv run ritboard app                        # starts its own server
+uv run ritboard app --url http://127.0.0.1:8765 --fullscreen   # window onto a running service
 ```
 
 Install as a command: `uv tool install .` (or `uv tool install '.[desktop]'`).
@@ -34,26 +34,28 @@ Install as a command: `uv tool install .` (or `uv tool install '.[desktop]'`).
 One endpoint for all workspaces. Every data tool takes a `workspace` argument.
 
 ```sh
-claude mcp add --transport http ritbord http://127.0.0.1:8765/mcp
+claude mcp add --transport http ritboard http://127.0.0.1:8765/mcp
 ```
 
 Tools: `list_workspaces`, `current_workspace`, `create_workspace`, `update_workspace`,
 `get_overview`, `list_findings`, `get_finding`, `add_finding`, `add_findings`,
 `update_finding`, `delete_finding`, `create_board`, `update_board`, `delete_board`,
-`get_board`, `place_findings`, `remove_from_board`.
+`get_board`, `place_findings`, `remove_from_board`, `publish_artifact`, `update_artifact`,
+`get_artifact`, `list_artifacts`, `delete_artifact`.
 
-Claude Desktop only starts MCP servers as local commands (stdio). `ritbord mcp` is that
-command: it forwards every call to the running Ritbord over its local HTTP socket, so there
+Claude Desktop only starts MCP servers as local commands (stdio). `ritboard mcp` is that
+command: it forwards every call to the running Ritboard over its local HTTP socket, so there
 is still one server and live updates still reach the board. It finds the server through
-`<data>/server.json`, which `ritbord serve` writes on start, so no port goes in the config.
-Add to `%APPDATA%\Claude\claude_desktop_config.json` and restart the app:
+`<data>/server.json`, which `ritboard serve` writes on start, so no port goes in the config.
+Run `uv run python scripts/add_to_claude_desktop.py` to add it, or add it to
+`%APPDATA%\Claude\claude_desktop_config.json` yourself, then restart the app:
 
 ```json
 {
   "mcpServers": {
-    "ritbord": {
+    "ritboard": {
       "command": "uv",
-      "args": ["--directory", "C:\\Users\\johan\\Projects\\ritbord", "run", "ritbord", "mcp"]
+      "args": ["--directory", "C:\\path\\to\\ritboard", "run", "ritboard", "mcp"]
     }
   }
 }
@@ -68,8 +70,10 @@ and `--token`.
 ## Model
 
 - **Workspace**: one project, one SQLite file in `<data>/workspaces/`. Deleting moves the file to `<data>/trash/`.
-- **Finding**: an item in the tree. Kinds: `md`, `text`, `csv` (table), `html` (sandboxed iframe),
-  `url` (framed page), `image`, `folder`. Exists whether or not it's on a board.
+- **Finding**: an item in the tree. Kinds: `md`, `text`, `csv` (table), `html` (a one-off
+  snippet in a sandboxed frame), `artifact` (shows an artifact), `url` (framed page), `image`,
+  `folder`. Exists whether or not it's on a board.
+- **Artifact**: a small website kept in the workspace, see below.
 - **Board**: a tab with a fixed size in pixels. Change it in Settings or over MCP at any time.
   Resizing never moves cards; cards left outside are outlined and listed under *On board*.
 - **Placement**: a finding on a board at `x, y, w, h`. A finding can sit on several boards.
@@ -103,11 +107,28 @@ cancelled out, so a 3840×2160 board fills a 4K panel exactly at 150% or 200% Wi
 
 Drag findings from the tree onto the board to place them, or onto another finding to nest them.
 
-## Claude artifacts
+## Artifacts
 
-A published Claude artifact can be framed with its embed URL (`kind: url`) if this host is
-in the artifact's allowed domains. More reliable: have the agent send the HTML itself
-(`kind: html`).
+An artifact is a page or small site that belongs to a workspace: `index.html` plus any
+scripts, styles, data and images. Every publish is a numbered version, kept whole.
+
+- Address: `/w/<workspace>/a/<id>/` for the latest version, `/w/<workspace>/a/<id>@3/` for
+  version 3. Relative links between its files work.
+- A card of kind `artifact` shows one, latest by default or pinned with `id@3`. When a new
+  version is published, every card showing it reloads. The ↗ in the card header opens it
+  full-window.
+- Pages run sandboxed with a throwaway origin, in a card and full-window alike: scripts run
+  and CDN libraries load, but they can't call Ritboard's API, and cookies and localStorage
+  are off. With `--token`, artifact pages are reachable without the token; their ids are
+  long and random.
+- Agents use `publish_artifact` (with `html` for one page or `files` for several) and
+  `update_artifact` (changed files only; the rest carry over). In the UI, make one with
+  ＋ Finding → kind Artifact, edit its `index.html` from the card, and manage them in the
+  Artifacts tab, where you can drag one onto the board.
+
+claude.ai refuses to be framed by other sites, so a `url` card pointing at claude.ai shows an
+Open button instead. To show a Claude artifact on the board, publish its HTML as a Ritboard
+artifact.
 
 ## Service
 
@@ -115,23 +136,23 @@ Linux (systemd, user service):
 
 ```sh
 uv tool install .
-mkdir -p ~/.config/systemd/user && cp deploy/ritbord.service ~/.config/systemd/user/
-systemctl --user enable --now ritbord
+mkdir -p ~/.config/systemd/user && cp deploy/ritboard.service ~/.config/systemd/user/
+systemctl --user enable --now ritboard
 ```
 
-Windows: `uv tool install .`, then run `ritbord serve` from Task Scheduler at logon,
+Windows: `uv tool install .`, then run `ritboard serve` from Task Scheduler at logon,
 or wrap it with NSSM for a real service.
 
 Listening beyond localhost:
 
 ```sh
-ritbord serve --host 0.0.0.0 --token "$(openssl rand -hex 16)" --allowed-host board.lan:8765
+ritboard serve --host 0.0.0.0 --token "$(openssl rand -hex 16)" --allowed-host board.lan:8765
 ```
 
 Open the UI once with `http://board.lan:8765/?token=...`; it sets a cookie. Agents send
 `Authorization: Bearer ...`.
 
-Settings via environment: `RITBORD_DATA`, `RITBORD_HOST`, `RITBORD_PORT`, `RITBORD_TOKEN`.
+Settings via environment: `RITBOARD_DATA`, `RITBOARD_HOST`, `RITBOARD_PORT`, `RITBOARD_TOKEN`.
 
 ## Develop
 
@@ -139,4 +160,4 @@ Settings via environment: `RITBORD_DATA`, `RITBORD_HOST`, `RITBORD_PORT`, `RITBO
 uv run pytest
 ```
 
-The UI is plain JavaScript in `src/ritbord/static/`, no build step.
+The UI is plain JavaScript in `src/ritboard/static/`, no build step.

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 from typing import Any
 
 from mcp.server.mcpserver import MCPServer
@@ -10,20 +11,27 @@ from pydantic import BaseModel, Field
 from .store import Registry
 
 INSTRUCTIONS = """\
-Ritbord is a big-screen planning board. Use it to post findings, sort them, and lay them out.
+Ritboard is a big-screen planning board. Use it to post findings, sort them, and lay them out.
 
 Model:
 - A workspace is one project. Every data tool takes `workspace` (id or name). Call
   list_workspaces first, or current_workspace to get the one open on screen.
 - A finding is an item in the workspace tree (left sidebar). It has a title, a kind, content,
   an optional category and tags, and an optional parent (to make a tree). Kinds:
-  md (markdown, tables allowed), text, csv (rendered as a table), html (full HTML document,
-  shown in a sandboxed iframe), url (any page shown in an iframe, e.g. a published Claude
-  artifact embed URL), image (URL or data URI), folder (a grouping node).
+  md (markdown, tables allowed), text, csv (rendered as a table), html (a one-off HTML
+  snippet in a sandboxed frame), artifact (a card showing an artifact, see below),
+  url (an external page in a frame), image (URL or data URI), folder (a grouping node).
+- An artifact is a small website kept in the workspace: index.html plus any scripts, styles,
+  data or images, with numbered versions and its own address. Use publish_artifact for any
+  page, app, chart or report worth revising; update_artifact makes a new version and every
+  card showing it reloads. Relative links between its files work. Pages run sandboxed: no
+  access to Ritboard's API, no cookies or localStorage; libraries from CDNs load normally.
+  To bring over a Claude artifact, read its HTML and publish it here (claude.ai pages
+  refuse to be framed, so a url card to claude.ai only shows an Open button).
 - A board is a tab with a fixed pixel size (e.g. 3840x2160). A finding only shows on a board
   once placed there. Coordinates are exact board pixels, origin top-left. Leave x/y out and
-  Ritbord picks a free spot.
-Prefer html or md content you write yourself over external URLs; many sites refuse framing.
+  Ritboard picks a free spot.
+Prefer content you write yourself (md, artifacts) over external URLs; many sites refuse framing.
 Read get_board before rearranging so you don't stack cards on top of each other.
 """
 
@@ -46,8 +54,37 @@ class PlacementIn(BaseModel):
     z: int | None = Field(None, description="Stacking order; higher is on top.")
 
 
-def build_mcp(reg: Registry, ui_state: dict[str, Any]) -> MCPServer:
-    mcp = MCPServer("ritbord", title="Ritbord", instructions=INSTRUCTIONS)
+class ArtifactFile(BaseModel):
+    path: str = Field(description="Relative path, e.g. index.html, app.js, data/rows.json, img/logo.png")
+    content: str
+    encoding: str = Field("text", description="text, or base64 for binary files such as images")
+
+
+def _decode(files: list[ArtifactFile] | None, html: str | None) -> dict[str, bytes]:
+    out: dict[str, bytes] = {}
+    for f in files or []:
+        if f.encoding == "base64":
+            out[f.path] = base64.b64decode(f.content)
+        elif f.encoding == "text":
+            out[f.path] = f.content.encode("utf-8")
+        else:
+            raise ValueError(f"encoding must be text or base64, not {f.encoding!r}")
+    if html is not None:
+        out["index.html"] = html.encode("utf-8")
+    return out
+
+
+def build_mcp(reg: Registry, ui_state: dict[str, Any], base_url: str = "") -> MCPServer:
+    mcp = MCPServer("ritboard", title="Ritboard", instructions=INSTRUCTIONS)
+
+    def art_url(ws: str, aid: str, version: int | None = None) -> str:
+        return f"{base_url}/w/{ws}/a/{aid}{'@' + str(version) if version else ''}/"
+
+    def art_out(ws: str, a: dict[str, Any]) -> dict[str, Any]:
+        a = {k: v for k, v in a.items() if k != "versions"}
+        a["url"] = art_url(ws, a["id"])
+        a["version_url"] = art_url(ws, a["id"], a["latest"])
+        return a
 
     def _overview(ws: str) -> dict[str, Any]:
         st = reg.get(ws)
@@ -268,5 +305,79 @@ def build_mcp(reg: Registry, ui_state: dict[str, Any]) -> MCPServer:
     async def remove_from_board(workspace: str, board_id: str, finding_ids: list[str]) -> dict[str, Any]:
         """Take findings off a board. They stay in the workspace tree."""
         return {"removed": reg.get(workspace).unplace(board_id, finding_ids)}
+
+    # ---- artifacts ------------------------------------------------------
+    @mcp.tool()
+    async def publish_artifact(
+        workspace: str,
+        title: str,
+        html: str | None = None,
+        files: list[ArtifactFile] | None = None,
+        entry: str = "index.html",
+        description: str = "",
+        source: str | None = None,
+        add_card: bool = True,
+        parent_id: str | None = None,
+        category: str | None = None,
+        tags: list[str] | None = None,
+        board_id: str | None = None,
+        x: int | None = None,
+        y: int | None = None,
+        w: int | None = None,
+        h: int | None = None,
+    ) -> dict[str, Any]:
+        """Publish a new artifact: a page or small site kept in this workspace, version 1.
+        Give `html` for a single page (saved as index.html), or `files` for several files.
+        By default it also adds a card for it to the tree; give board_id to place that card."""
+        st = reg.get(workspace)
+        a = st.create_artifact(title, _decode(files, html), entry, description, source)
+        out: dict[str, Any] = {"artifact": art_out(st.id, a)}
+        if add_card:
+            f = st.add_finding(title, a["id"], "artifact", parent_id, category, tags, source)
+            out["finding_id"] = f["id"]
+            if board_id:
+                out["placement"] = st.place(board_id, [{"finding_id": f["id"], "x": x, "y": y, "w": w, "h": h}])[0]
+        return out
+
+    @mcp.tool()
+    async def update_artifact(
+        workspace: str,
+        artifact_id: str,
+        html: str | None = None,
+        files: list[ArtifactFile] | None = None,
+        remove: list[str] | None = None,
+        note: str = "",
+        title: str | None = None,
+        description: str | None = None,
+        entry: str | None = None,
+        source: str | None = None,
+    ) -> dict[str, Any]:
+        """Make a new version of an artifact. It starts from the latest files; given files are
+        added or replaced, `remove` deletes paths. `html` replaces index.html. Every card
+        showing the artifact reloads. Title/description changes alone don't add a version."""
+        st = reg.get(workspace)
+        a = st.update_artifact(artifact_id, _decode(files, html), remove, note, title, description, entry, source)
+        return art_out(st.id, a)
+
+    @mcp.tool()
+    async def get_artifact(
+        workspace: str, artifact_id: str, version: int | None = None, include_content: bool = True
+    ) -> dict[str, Any]:
+        """An artifact with its version history and the files of one version (latest by
+        default). Binary files come back base64-encoded."""
+        st = reg.get(workspace)
+        a = st.get_artifact(artifact_id, version, include_content)
+        return {**art_out(st.id, a), "versions": a["versions"]}
+
+    @mcp.tool()
+    async def list_artifacts(workspace: str) -> dict[str, Any]:
+        """All artifacts in a workspace: id, title, latest version, file count, size, address."""
+        st = reg.get(workspace)
+        return {"artifacts": [art_out(st.id, a) for a in st.list_artifacts()]}
+
+    @mcp.tool()
+    async def delete_artifact(workspace: str, artifact_id: str) -> dict[str, Any]:
+        """Delete an artifact with all its versions, and the cards that show it."""
+        return reg.get(workspace).delete_artifact(artifact_id)
 
     return mcp

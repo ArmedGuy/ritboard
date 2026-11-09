@@ -182,6 +182,8 @@ body.side-off #sidebar { transform: translateX(-110%); }
 .node .ob { color: var(--accent); font-size: 11px; flex: none; width: 10px; text-align: center; }
 .node .xy { font: 10px var(--mono); color: var(--chrome-dim); }
 .node .bad { color: var(--danger); }
+.node .mini-link { color: var(--accent); text-decoration: none; padding: 0 4px; }
+#ed-art a { color: var(--accent); }
 .node button.mini { background: var(--chrome-3); border: 1px solid var(--chrome-line); border-radius: 3px; font-size: 11px; padding: 0 5px; cursor: pointer; }
 .group-h { display: flex; align-items: center; gap: 8px; padding: 10px 10px 4px; color: var(--chrome-dim); font-size: 11px; text-transform: uppercase; letter-spacing: .05em; }
 .group-h .cd { width: 10px; height: 10px; border-radius: 2px; }
@@ -231,3 +233,4 @@ dialog::backdrop { background: rgba(0,0,0,.5); }
 #set-cats label { flex-direction: row; align-items: center; gap: 6px; color: var(--chrome-text); }
 #set-cats input[type=color] { width: 36px; height: 24px; flex: none; }
 code.copy { font: 12px var(--mono); background: var(--chrome-2); padding: 6px 8px; border-radius: 4px; user-select: all; word-break: break-all; }
+.node.art { padding-left: 6px; }

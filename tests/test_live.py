@@ -12,7 +12,7 @@ import uvicorn
 import websockets
 from mcp import Client
 
-from ritbord.server import Config, create_app
+from ritboard.server import Config, create_app
 
 
 def _port():
@@ -98,7 +98,7 @@ def test_mcp_flow_with_live_push(server):
 
 def test_rest_and_ui_assets(server):
     r = httpx.get(server + "/")
-    assert r.status_code == 200 and "Ritbord" in r.text
+    assert r.status_code == 200 and "Ritboard" in r.text
     assert httpx.get(server + "/static/app.js").status_code == 200
     ws = httpx.post(server + "/api/workspaces", json={"name": "Rest"}).json()
     f = httpx.post(f"{server}/api/w/{ws['id']}/findings", json={"title": "t", "content": "**b**"}).json()
@@ -136,7 +136,31 @@ def test_token_gate(tmp_path):
         assert httpx.get(url + "/api/workspaces").status_code == 401
         assert httpx.get(url + "/api/workspaces", headers={"Authorization": "Bearer s3cret"}).status_code == 200
         r = httpx.get(url + "/?token=s3cret")
-        assert r.status_code == 200 and "ritbord_token" in r.headers.get("set-cookie", "")
+        assert r.status_code == 200 and "ritboard_token" in r.headers.get("set-cookie", "")
+    finally:
+        srv.should_exit = True
+        t.join(5)
+
+
+def test_token_gate_lets_artifact_pages_through(tmp_path):
+    port = _port()
+    app = create_app(Config(data_dir=tmp_path, host="127.0.0.1", port=port, token="s3cret"))
+    srv = uvicorn.Server(uvicorn.Config(app, host="127.0.0.1", port=port, log_level="warning"))
+    t = threading.Thread(target=srv.run, daemon=True)
+    t.start()
+    url = f"http://127.0.0.1:{port}"
+    auth = {"Authorization": "Bearer s3cret"}
+    for _ in range(100):
+        try:
+            httpx.get(url + "/api/info")
+            break
+        except Exception:
+            time.sleep(0.05)
+    try:
+        ws = httpx.post(url + "/api/workspaces", json={"name": "T"}, headers=auth).json()["id"]
+        aid = httpx.post(f"{url}/api/w/{ws}/artifacts", json={"title": "P", "files": {"index.html": "ok"}}, headers=auth).json()["artifact"]["id"]
+        assert httpx.get(f"{url}/w/{ws}/a/{aid}/").text == "ok"
+        assert httpx.get(f"{url}/api/w/{ws}/artifacts").status_code == 401
     finally:
         srv.should_exit = True
         t.join(5)

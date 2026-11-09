@@ -9,7 +9,7 @@ from test_live import data, server  # noqa: F401  (fixture)
 
 
 def _bridge(url):
-    return StdioServerParameters(command=sys.executable, args=["-m", "ritbord.cli", "mcp", "--url", url])
+    return StdioServerParameters(command=sys.executable, args=["-m", "ritboard.cli", "mcp", "--url", url])
 
 
 def test_bridge_forwards(server):  # noqa: F811
@@ -28,7 +28,7 @@ def test_bridge_without_server():
         async with Client(_bridge("http://127.0.0.1:9")) as c:
             assert (await c.list_tools()).tools
             res = await c.call_tool("list_workspaces", {})
-            assert res.is_error and "Could not reach Ritbord" in res.content[0].text
+            assert res.is_error and "Could not reach Ritboard" in res.content[0].text
 
     asyncio.run(run())
 
@@ -39,7 +39,7 @@ def test_bridge_finds_server_via_beacon(server, tmp_path_factory):  # noqa: F811
     data_dir = httpx.get(server + "/api/info").json()["data_dir"]
 
     async def run():
-        params = StdioServerParameters(command=sys.executable, args=["-m", "ritbord.cli", "mcp", "--data", data_dir])
+        params = StdioServerParameters(command=sys.executable, args=["-m", "ritboard.cli", "mcp", "--data", data_dir])
         async with Client(params) as c:
             res = data(await c.call_tool("list_workspaces", {}))
             assert res["workspaces"]

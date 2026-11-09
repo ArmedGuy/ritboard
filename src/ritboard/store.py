@@ -6,7 +6,9 @@ A placement puts a finding on one board at exact pixel coordinates.
 
 from __future__ import annotations
 
+import base64
 import json
+import mimetypes
 import re
 import secrets
 import shutil
@@ -37,7 +39,10 @@ DEFAULT_SIZES = {
     "url": (640, 480),
     "image": (400, 300),
     "folder": (300, 220),
+    "artifact": (800, 600),
 }
+
+ARTIFACT_MAX_BYTES = 16 * 1024 * 1024  # per version, all files together
 
 PALETTE = ["#d1495b", "#edae49", "#00798c", "#30638e", "#6a994e", "#8d6a9f", "#c97b63", "#4f6d7a"]
 
@@ -76,6 +81,32 @@ CREATE TABLE IF NOT EXISTS placements (
     z INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (board_id, finding_id)
 );
+CREATE TABLE IF NOT EXISTS artifacts (
+    id TEXT PRIMARY KEY,
+    title TEXT NOT NULL,
+    description TEXT NOT NULL DEFAULT '',
+    entry TEXT NOT NULL DEFAULT 'index.html',
+    latest INTEGER NOT NULL DEFAULT 0,
+    source TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS artifact_versions (
+    artifact_id TEXT NOT NULL REFERENCES artifacts(id) ON DELETE CASCADE,
+    version INTEGER NOT NULL,
+    note TEXT NOT NULL DEFAULT '',
+    source TEXT,
+    created_at TEXT NOT NULL,
+    PRIMARY KEY (artifact_id, version)
+);
+CREATE TABLE IF NOT EXISTS artifact_files (
+    artifact_id TEXT NOT NULL REFERENCES artifacts(id) ON DELETE CASCADE,
+    version INTEGER NOT NULL,
+    path TEXT NOT NULL,
+    content BLOB NOT NULL,
+    content_type TEXT NOT NULL,
+    PRIMARY KEY (artifact_id, version, path)
+);
 """
 
 
@@ -87,9 +118,37 @@ def now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="milliseconds")
 
 
-def new_id(prefix: str) -> str:
+def new_id(prefix: str, n: int = 8) -> str:
     alphabet = "abcdefghjkmnpqrstuvwxyz23456789"
-    return prefix + "_" + "".join(secrets.choice(alphabet) for _ in range(8))
+    return prefix + "_" + "".join(secrets.choice(alphabet) for _ in range(n))
+
+
+def clean_path(path: str) -> str:
+    """A relative file path inside an artifact: forward slashes, no '..', no leading '/'."""
+    p = (path or "").replace("\\", "/").strip()
+    while p.startswith("./"):
+        p = p[2:]
+    parts = p.split("/")
+    if not p or p.startswith("/") or len(p) > 240 or any(s in ("", ".", "..") for s in parts):
+        raise ValueError(f"bad file path {path!r}; use a relative path like 'index.html' or 'data/rows.json'")
+    return p
+
+
+def content_type(path: str) -> str:
+    ct = mimetypes.guess_type(path)[0] or "application/octet-stream"
+    if path.endswith((".js", ".mjs")):
+        ct = "text/javascript"
+    if ct.startswith("text/") or ct in ("application/json", "image/svg+xml"):
+        ct += "; charset=utf-8"
+    return ct
+
+
+def parse_artifact_ref(ref: str) -> tuple[str, int | None]:
+    """'a_xxx' -> latest; 'a_xxx@3' -> version 3."""
+    aid, _, ver = (ref or "").strip().partition("@")
+    if ver and not ver.isdigit():
+        raise ValueError(f"bad artifact reference {ref!r}; use 'id' or 'id@version'")
+    return aid, int(ver) if ver else None
 
 
 def slugify(name: str) -> str:
@@ -277,6 +336,8 @@ class WorkspaceStore:
         kind = normalize_kind(kind)
         parent_id = parent_id or None
         self._check_parent(None, parent_id)
+        if kind == "artifact":
+            content = self._check_artifact_ref(content)
         fid = new_id("f")
         t = now()
         with self._tx() as db:
@@ -344,6 +405,8 @@ class WorkspaceStore:
                 sets["sort"] = self._q(
                     "SELECT COALESCE(MAX(sort),0)+1 m FROM findings WHERE parent_id IS ?", (parent_id,)
                 )[0]["m"]
+        if sets.get("kind", cur["kind"]) == "artifact" and ("kind" in sets or "content" in sets):
+            sets["content"] = self._check_artifact_ref(sets.get("content", cur["content"]))
         if "kind" in sets or "content" in sets:
             sets["rendered"] = render(sets.get("kind", cur["kind"]), sets.get("content", cur["content"]))
         if not sets:
@@ -513,6 +576,162 @@ class WorkspaceStore:
         self.changed("placements")
         return n
 
+    # ---- artifacts ------------------------------------------------------
+    # An artifact is a small website kept in this workspace: an entry page plus any other
+    # files, stored whole for every version. Cards of kind "artifact" point at one by id.
+
+    def _check_artifact_ref(self, ref: str) -> str:
+        aid, ver = parse_artifact_ref(ref)
+        a = self.artifact_meta(aid)
+        if ver is not None and not 1 <= ver <= a["latest"]:
+            raise ValueError(f"artifact {aid} has versions 1 to {a['latest']}")
+        return f"{aid}@{ver}" if ver else aid
+
+    def artifact_meta(self, aid: str) -> dict[str, Any]:
+        rows = self._q("SELECT * FROM artifacts WHERE id=?", (aid,))
+        if not rows:
+            raise NotFound(f"artifact {aid} not found")
+        return dict(rows[0])
+
+    def list_artifacts(self) -> list[dict[str, Any]]:
+        rows = self._q(
+            "SELECT a.*, (SELECT COUNT(*) FROM artifact_files f WHERE f.artifact_id=a.id AND f.version=a.latest) files,"
+            " (SELECT COALESCE(SUM(LENGTH(content)),0) FROM artifact_files f WHERE f.artifact_id=a.id AND f.version=a.latest) bytes"
+            " FROM artifacts a ORDER BY a.updated_at DESC"
+        )
+        return [dict(r) for r in rows]
+
+    def get_artifact(self, aid: str, version: int | None = None, with_content: bool = False) -> dict[str, Any]:
+        a = self.artifact_meta(aid)
+        v = version or a["latest"]
+        if not 1 <= v <= a["latest"]:
+            raise NotFound(f"artifact {aid} has no version {v}")
+        files = []
+        for r in self._q(
+            "SELECT path, content, content_type FROM artifact_files WHERE artifact_id=? AND version=? ORDER BY path", (aid, v)
+        ):
+            f: dict[str, Any] = {"path": r["path"], "content_type": r["content_type"], "size": len(r["content"])}
+            if with_content:
+                if r["content_type"].startswith("text/") or "json" in r["content_type"] or "svg" in r["content_type"]:
+                    f["content"], f["encoding"] = bytes(r["content"]).decode("utf-8", "replace"), "text"
+                else:
+                    f["content"], f["encoding"] = base64.b64encode(r["content"]).decode(), "base64"
+            files.append(f)
+        versions = [dict(r) for r in self._q(
+            "SELECT version, note, source, created_at FROM artifact_versions WHERE artifact_id=? ORDER BY version", (aid,)
+        )]
+        return {**a, "version": v, "files": files, "versions": versions}
+
+    def artifact_file(self, aid: str, version: int | None, path: str) -> tuple[bytes, str]:
+        a = self.artifact_meta(aid)
+        v = version or a["latest"]
+        rows = self._q(
+            "SELECT content, content_type FROM artifact_files WHERE artifact_id=? AND version=? AND path=?",
+            (aid, v, path or a["entry"]),
+        )
+        if not rows:
+            raise NotFound(f"{path or a['entry']} not in artifact {aid} v{v}")
+        return bytes(rows[0]["content"]), rows[0]["content_type"]
+
+    def _write_version(
+        self, db, aid: str, version: int, files: dict[str, bytes], note: str, source: str | None
+    ) -> None:
+        total = sum(len(b) for b in files.values())
+        if total > ARTIFACT_MAX_BYTES:
+            raise ValueError(f"artifact is {total} bytes; the limit is {ARTIFACT_MAX_BYTES}")
+        db.execute(
+            "INSERT INTO artifact_versions(artifact_id,version,note,source,created_at) VALUES(?,?,?,?,?)",
+            (aid, version, note or "", source, now()),
+        )
+        db.executemany(
+            "INSERT INTO artifact_files(artifact_id,version,path,content,content_type) VALUES(?,?,?,?,?)",
+            [(aid, version, path, sqlite3.Binary(data), content_type(path)) for path, data in files.items()],
+        )
+
+    def create_artifact(
+        self,
+        title: str,
+        files: dict[str, bytes],
+        entry: str = "index.html",
+        description: str = "",
+        source: str | None = None,
+        note: str = "",
+    ) -> dict[str, Any]:
+        files = {clean_path(p): b for p, b in files.items()}
+        entry = clean_path(entry)
+        if entry not in files:
+            raise ValueError(f"the entry file {entry} is missing; files given: {', '.join(files) or 'none'}")
+        aid = new_id("a", 16)  # long: artifact pages are served without the token
+        t = now()
+        with self._tx() as db:
+            db.execute(
+                "INSERT INTO artifacts(id,title,description,entry,latest,source,created_at,updated_at) VALUES(?,?,?,?,1,?,?,?)",
+                (aid, title, description or "", entry, source, t, t),
+            )
+            self._write_version(db, aid, 1, files, note or "first version", source)
+        self.changed("artifacts")
+        return self.get_artifact(aid)
+
+    def update_artifact(
+        self,
+        aid: str,
+        files: dict[str, bytes] | None = None,
+        remove: list[str] | None = None,
+        note: str = "",
+        title: str | None = None,
+        description: str | None = None,
+        entry: str | None = None,
+        source: str | None = None,
+    ) -> dict[str, Any]:
+        """New version = latest files, plus/overwritten by `files`, minus `remove`.
+        Changing only title/description doesn't make a new version."""
+        a = self.artifact_meta(aid)
+        new_files = {clean_path(p): b for p, b in (files or {}).items()}
+        drop = {clean_path(p) for p in (remove or [])}
+        entry = clean_path(entry) if entry else a["entry"]
+        with self._tx() as db:
+            sets = {"updated_at": now()}
+            if title is not None:
+                sets["title"] = title
+            if description is not None:
+                sets["description"] = description
+            if new_files or drop or entry != a["entry"]:
+                cur = {
+                    r["path"]: bytes(r["content"])
+                    for r in db.execute(
+                        "SELECT path, content FROM artifact_files WHERE artifact_id=? AND version=?", (aid, a["latest"])
+                    )
+                }
+                missing = drop - set(cur)
+                if missing:
+                    raise ValueError(f"not in the artifact: {', '.join(sorted(missing))}")
+                merged = {p: b for p, b in cur.items() if p not in drop}
+                merged.update(new_files)
+                if entry not in merged:
+                    raise ValueError(f"the entry file {entry} would be missing")
+                v = a["latest"] + 1
+                self._write_version(db, aid, v, merged, note, source)
+                sets.update(latest=v, entry=entry)
+            cols = ", ".join(f"{k}=?" for k in sets)
+            db.execute(f"UPDATE artifacts SET {cols} WHERE id=?", (*sets.values(), aid))
+            # Cards showing this artifact re-render when their finding changes.
+            db.execute(
+                "UPDATE findings SET updated_at=? WHERE kind='artifact' AND (content=? OR content LIKE ?)",
+                (sets["updated_at"], aid, aid + "@%"),
+            )
+        self.changed("artifacts")
+        return self.get_artifact(aid)
+
+    def delete_artifact(self, aid: str) -> dict[str, Any]:
+        self.artifact_meta(aid)
+        with self._tx() as db:
+            n = db.execute(
+                "DELETE FROM findings WHERE kind='artifact' AND (content=? OR content LIKE ?)", (aid, aid + "@%")
+            ).rowcount
+            db.execute("DELETE FROM artifacts WHERE id=?", (aid,))
+        self.changed("artifacts")
+        return {"deleted": aid, "cards_removed": n}
+
     # ---- views ----------------------------------------------------------
     def state(self) -> dict[str, Any]:
         """Everything the UI needs for this workspace."""
@@ -522,6 +741,7 @@ class WorkspaceStore:
             "findings": self.list_findings(),
             "boards": self.list_boards(),
             "placements": self.placements(),
+            "artifacts": self.list_artifacts(),
         }
 
     def board_view(self, bid: str) -> dict[str, Any]:

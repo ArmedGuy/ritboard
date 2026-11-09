@@ -13,7 +13,7 @@ import io
 
 from markdown_it import MarkdownIt
 
-KINDS = ("md", "text", "csv", "html", "url", "image", "folder")
+KINDS = ("md", "text", "csv", "html", "artifact", "url", "image", "folder")
 KIND_ALIASES = {
     "markdown": "md",
     "table": "csv",
@@ -21,7 +21,8 @@ KIND_ALIASES = {
     "plain": "text",
     "iframe": "url",
     "link": "url",
-    "artifact": "url",
+    "app": "artifact",
+    "page": "artifact",
     "img": "image",
     "group": "folder",
     "dir": "folder",

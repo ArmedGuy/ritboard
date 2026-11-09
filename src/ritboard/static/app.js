@@ -1,4 +1,4 @@
-// Ritbord UI. No build step, no dependencies.
+// Ritboard UI. No build step, no dependencies.
 'use strict';
 
 const $ = (s, el = document) => el.querySelector(s);
@@ -24,9 +24,19 @@ function s(tag, attrs = {}) {
   return el;
 }
 
+// Keys saved before the rename (Ritbord) carry over once.
+try {
+  for (let i = 0; i < localStorage.length; i++) {
+    const k = localStorage.key(i);
+    if (k.startsWith('ritbord:') && localStorage.getItem('ritboard:' + k.slice(8)) == null) {
+      localStorage.setItem('ritboard:' + k.slice(8), localStorage.getItem(k));
+    }
+  }
+} catch { /* storage off */ }
+
 const LS = {
-  get(k, d) { try { const v = localStorage.getItem('ritbord:' + k); return v == null ? d : JSON.parse(v); } catch { return d; } },
-  set(k, v) { try { localStorage.setItem('ritbord:' + k, JSON.stringify(v)); } catch { /* storage off */ } },
+  get(k, d) { try { const v = localStorage.getItem('ritboard:' + k); return v == null ? d : JSON.parse(v); } catch { return d; } },
+  set(k, v) { try { localStorage.setItem('ritboard:' + k, JSON.stringify(v)); } catch { /* storage off */ } },
 };
 
 // ---------------------------------------------------------------- api
@@ -88,6 +98,7 @@ const S = {
 const by = {
   finding: new Map(),
   children: new Map(),
+  artifact: new Map(),
 };
 
 function board() { return S.data?.boards.find((b) => b.id === S.boardId) || null; }
@@ -100,6 +111,7 @@ function isOOB(g, b = board()) { return b && (g.x < 0 || g.y < 0 || g.x + g.w > 
 function index() {
   by.finding.clear();
   by.children.clear();
+  by.artifact = new Map((S.data.artifacts || []).map((a) => [a.id, a]));
   for (const f of S.data.findings) {
     by.finding.set(f.id, f);
     const k = f.parent_id || '';
@@ -351,6 +363,18 @@ function makeCard(fid) {
     h('div', { class: 'resize-handle' }));
 }
 
+function parseRef(ref) {
+  const [id, v] = String(ref || '').split('@');
+  return { id, version: v ? +v : null };
+}
+function artifactUrl(ref) { return `/w/${encodeURIComponent(S.ws)}/a/${ref}/`; }
+function artifactLabel(f) {
+  const { id, version } = parseRef(f.content);
+  const a = by.artifact.get(id);
+  if (!a) return 'artifact ?';
+  return version ? `v${version} of ${a.latest} · pinned` : `artifact v${a.latest}`;
+}
+
 // Sites known to refuse being shown inside another page. Their cards get a button instead.
 function refusesFraming(url) {
   try {
@@ -369,15 +393,20 @@ function updateCard(card, f, g) {
   card.classList.toggle('sel', S.selected.has(f.id));
   card.classList.toggle('oob', !!isOOB(g));
   $('.title', card).textContent = f.title;
-  $('.kind', card).textContent = KIND_LABEL[f.kind] || f.kind;
+  $('.kind', card).textContent = f.kind === 'artifact' ? artifactLabel(f) : (KIND_LABEL[f.kind] || f.kind);
   $('.src', card).textContent = f.source || '';
   const open = $('a.open', card);
-  open.hidden = f.kind !== 'url' || !/^https?:/i.test(f.content || '');
-  if (!open.hidden) open.href = f.content;
+  if (f.kind === 'artifact') {
+    open.hidden = !by.artifact.has(parseRef(f.content).id);
+    open.href = artifactUrl(f.content);
+  } else {
+    open.hidden = f.kind !== 'url' || !/^https?:/i.test(f.content || '');
+    if (!open.hidden) open.href = f.content;
+  }
   card.title = [f.category && `Category: ${f.category}`, f.tags?.length && `Tags: ${f.tags.join(', ')}`].filter(Boolean).join('\n');
   const ver = f.kind === 'folder'
     ? f.updated_at + '|' + (by.children.get(f.id) || []).map((c) => c.id + c.title).join(',')
-    : f.updated_at + f.kind;
+    : f.updated_at + f.kind + (f.kind === 'artifact' ? '|' + (by.artifact.get(parseRef(f.content).id)?.latest ?? 'x') : '');
   if (card.dataset.ver !== ver) {
     card.dataset.ver = ver;
     fillBody($('.card-body', card), f);
@@ -400,16 +429,20 @@ function fillBody(body, f) {
     body.append(kids.length
       ? h('ul', { class: 'folder-list' }, kids.map((k) => h('li', {}, k.title)))
       : h('div', { class: 'ph' }, 'Empty folder'));
+  } else if (f.kind === 'artifact' && !by.artifact.has(parseRef(f.content).id)) {
+    body.classList.add('framed');
+    body.dataset.noframe = '1';
+    body.append(h('div', { class: 'ph' }, 'This artifact no longer exists.'));
   } else if (f.kind === 'url' && refusesFraming(f.content)) {
     body.classList.add('framed');
     body.dataset.noframe = '1';
     body.append(h('div', { class: 'ph noframe' },
       h('div', {}, 'claude.ai won’t show its pages inside another site.'),
       h('a', { href: f.content, target: '_blank', rel: 'noopener noreferrer' }, 'Open in a new window ↗'),
-      h('small', {}, 'To show an artifact here, post its HTML as an html card.')));
+      h('small', {}, 'To show a Claude artifact here, publish its HTML as a Ritboard artifact.')));
   } else {
     body.classList.add('framed');
-    body.append(h('div', { class: 'ph' }, f.kind === 'url' ? (f.content || 'No URL') : 'HTML'));
+    body.append(h('div', { class: 'ph' }, f.kind === 'url' ? (f.content || 'No URL') : f.title));
   }
   updateFrames();
 }
@@ -435,7 +468,7 @@ function updateFrames() {
     const v0 = toBoard(vp.left, vp.top), v1 = toBoard(vp.right, vp.bottom);
     for (const [fid, card] of S.cardEls) {
       const f = by.finding.get(fid);
-      if (!f || (f.kind !== 'html' && f.kind !== 'url')) continue;
+      if (!f || (f.kind !== 'html' && f.kind !== 'url' && f.kind !== 'artifact')) continue;
       const g = S.geom.get(fid);
       if (!g) continue;
       const body = $('.card-body', card);
@@ -446,6 +479,12 @@ function updateFrames() {
         body.dataset.loaded = '1';
         const frame = f.kind === 'html'
           ? h('iframe', { sandbox: 'allow-scripts allow-popups allow-forms allow-modals', srcdoc: wrapHtml(f.content || ''), loading: 'lazy' })
+          : f.kind === 'artifact'
+          ? h('iframe', {
+            src: artifactUrl(f.content), loading: 'lazy', title: f.title,
+            sandbox: 'allow-scripts allow-forms allow-popups allow-popups-to-escape-sandbox allow-modals allow-downloads allow-presentation',
+            allow: 'clipboard-write; fullscreen',
+          })
           : h('iframe', {
             class: 'web', src: f.content, loading: 'lazy', referrerpolicy: 'no-referrer',
             sandbox: 'allow-scripts allow-same-origin allow-forms allow-popups allow-popups-to-escape-sandbox allow-presentation',
@@ -499,6 +538,8 @@ function renderSidebar() {
       body.append(...groups.get(c).map((f) => node(f, 0, false)));
     }
     if (!names.length) body.append(h('div', { class: 'empty' }, 'No findings.'));
+  } else if (S.sideTab === 'arts') {
+    renderArtifactsTab(body, q);
   } else {
     const b = board();
     const rows = [...S.geom.entries()].map(([id, g]) => ({ f: by.finding.get(id), g })).filter((r) => r.f && match(r.f));
@@ -515,7 +556,7 @@ function renderSidebar() {
   body.scrollTop = scroll;
 }
 
-const KIND_ICON = { md: 'MD', text: 'TXT', csv: 'TBL', html: 'HTM', url: 'WEB', image: 'IMG', folder: 'DIR' };
+const KIND_ICON = { md: 'MD', text: 'TXT', csv: 'TBL', html: 'HTM', artifact: 'APP', url: 'WEB', image: 'IMG', folder: 'DIR' };
 
 function node(f, depth, tree, g, oob) {
   const kids = by.children.get(f.id) || [];
@@ -527,7 +568,7 @@ function node(f, depth, tree, g, oob) {
     onclick: () => treeClick(f.id),
     ondblclick: () => openEditor(f.id),
     ondragstart: (e) => {
-      e.dataTransfer.setData('application/x-ritbord-finding', f.id);
+      e.dataTransfer.setData('application/x-ritboard-finding', f.id);
       e.dataTransfer.setData('text/plain', f.title);
       e.dataTransfer.effectAllowed = 'copyMove';
     },
@@ -551,7 +592,7 @@ function node(f, depth, tree, g, oob) {
 
   if (tree) {
     el.addEventListener('dragover', (e) => {
-      if (!e.dataTransfer.types.includes('application/x-ritbord-finding')) return;
+      if (!e.dataTransfer.types.includes('application/x-ritboard-finding')) return;
       e.preventDefault(); e.stopPropagation();
       el.classList.add('drop');
     });
@@ -559,7 +600,7 @@ function node(f, depth, tree, g, oob) {
     el.addEventListener('drop', async (e) => {
       e.preventDefault(); e.stopPropagation();
       el.classList.remove('drop');
-      const id = e.dataTransfer.getData('application/x-ritbord-finding');
+      const id = e.dataTransfer.getData('application/x-ritboard-finding');
       if (!id || id === f.id) return;
       S.expanded.add(f.id); LS.set('expanded', [...S.expanded]);
       await api.patch(`${W()}/findings/${id}`, { parent_id: f.id });
@@ -765,10 +806,12 @@ function onWheel(e) {
   applyView();
 }
 
-function onDrop(e) {
-  const id = e.dataTransfer.getData('application/x-ritbord-finding');
-  if (!id || !board()) return;
+async function onDrop(e) {
+  const aid = e.dataTransfer.getData('application/x-ritboard-artifact');
+  let id = e.dataTransfer.getData('application/x-ritboard-finding');
+  if ((!id && !aid) || !board()) return;
   e.preventDefault();
+  if (aid) id = (await cardForArtifact(aid)).id;
   const pt = toBoard(e.clientX, e.clientY);
   const item = { finding_id: id, x: snap(pt.x - 20), y: snap(pt.y - 15) };
   api.put(`${W()}/boards/${S.boardId}/placements`, [item]).then(() => { S.selected = new Set([id]); });
@@ -822,12 +865,62 @@ function toggleSidebar() { document.body.classList.toggle('side-off'); LS.set('s
 function toggleChrome() { document.body.classList.toggle('chrome-off'); LS.set('chromeOff', document.body.classList.contains('chrome-off')); }
 
 // ---------------------------------------------------------------- editor
+function cardsFor(aid) {
+  return S.data.findings.filter((f) => f.kind === 'artifact' && parseRef(f.content).id === aid);
+}
+
+function renderArtifactsTab(body, q) {
+  const arts = (S.data.artifacts || []).filter((a) => !q || a.title.toLowerCase().includes(q));
+  if (!arts.length) {
+    body.append(h('div', { class: 'empty' }, q ? 'Nothing matches.'
+      : 'No artifacts yet. Agents publish them with publish_artifact, or make one with ＋ Finding and kind Artifact.'));
+    return;
+  }
+  for (const a of arts) {
+    const cards = cardsFor(a.id);
+    const onBoard = cards.some((c) => S.geom.has(c.id));
+    body.append(h('div', {
+      class: 'node art', draggable: 'true', title: `${a.title}\n${a.files} files · ${fmtBytes(a.bytes)} · updated ${new Date(a.updated_at).toLocaleString()}\nDrag onto the board to show it.`,
+      ondragstart: (e) => {
+        e.dataTransfer.setData('application/x-ritboard-artifact', a.id);
+        e.dataTransfer.setData('text/plain', a.title);
+      },
+      onclick: () => { if (cards[0]) treeClick(cards[0].id); },
+      ondblclick: async () => openEditor(cards[0] ? cards[0].id : (await cardForArtifact(a.id)).id),
+    },
+    h('span', { class: 'ki' }, 'APP'),
+    h('span', { class: 'tt' }, a.title),
+    h('span', { class: 'xy' }, `v${a.latest}`),
+    onBoard ? h('span', { class: 'ob', title: 'On this board' }, '✓') : h('span', { class: 'ob' }),
+    h('a', { class: 'mini-link', href: artifactUrl(a.id), target: '_blank', rel: 'noopener', title: 'Open in a new window', onclick: (e) => e.stopPropagation() }, '↗'),
+    h('button', {
+      class: 'mini', title: 'Delete the artifact, all its versions and its cards',
+      onclick: async (e) => {
+        e.stopPropagation();
+        if (!confirm(`Delete artifact “${a.title}” with all ${a.latest} version(s)${cards.length ? ` and its ${cards.length} card(s)` : ''}?`)) return;
+        await api.del(`${W()}/artifacts/${a.id}`);
+      },
+    }, '✕')));
+  }
+}
+
+function fmtBytes(n) { return n < 1024 ? `${n} B` : n < 1048576 ? `${(n / 1024).toFixed(1)} KB` : `${(n / 1048576).toFixed(1)} MB`; }
+
+// The tree card for an artifact, created if it has none yet.
+async function cardForArtifact(aid) {
+  const existing = cardsFor(aid)[0];
+  if (existing) return existing;
+  const a = by.artifact.get(aid);
+  return api.post(`${W()}/findings`, { title: a?.title || 'Artifact', kind: 'artifact', content: aid, source: 'you' });
+}
+
 const HINTS = {
   md: 'Markdown. Tables, lists and code blocks work. Raw HTML is shown as text.',
   text: 'Shown as-is in a monospace block.',
   csv: 'First row is the header. Comma, semicolon, tab or | separated.',
-  html: 'A full HTML document or a fragment. Runs in a sandboxed frame with scripts allowed.',
-  url: 'A page to frame. Many sites refuse framing. For a published Claude artifact, use its embed URL and add this host to the artifact’s allowed domains.',
+  html: 'A one-off HTML snippet or document, stored in the card. Runs sandboxed with scripts allowed. For anything you will revise, use Artifact.',
+  artifact: 'A page kept as an artifact: every save is a new version, it has its own address (↗), and every card showing it reloads. Scripts run sandboxed.',
+  url: 'A page to frame. Many sites refuse framing; claude.ai always does. To show a Claude artifact, publish its HTML as an Artifact.',
   image: 'An image URL or a data: URI.',
   folder: 'Groups findings in the tree. Placed on a board it lists its children.',
 };
@@ -843,8 +936,14 @@ function openEditor(id, parentId) {
   form.kind.value = f?.kind || (parentId === 'folder' ? 'folder' : 'md');
   form.category.value = f?.category || '';
   form.tags.value = (f?.tags || []).join(', ');
-  form.content.value = f?.content || '';
+  form.content.value = f?.kind === 'artifact' ? '' : (f?.content || '');
   form.dataset.parent = f ? '' : (parentId && parentId !== 'folder' ? parentId : '');
+  // An artifact card's kind is fixed, and an existing card can't turn into an artifact card.
+  form.kind.disabled = f?.kind === 'artifact';
+  form.kind.querySelector('option[value=artifact]').disabled = !!f && f.kind !== 'artifact';
+  delete form.dataset.artifact;
+  $('#ed-art').textContent = '';
+  if (f?.kind === 'artifact') loadArtifactIntoEditor(f);
   $('#ed-place-wrap').hidden = !!f;
   $('#ed-delete').hidden = !f;
   $('#ed-toggle-place').hidden = !f;
@@ -854,11 +953,40 @@ function openEditor(id, parentId) {
   refreshEditorPlaceButton();
   setTimeout(() => (f ? form.content : form.title).focus(), 0);
 }
+async function loadArtifactIntoEditor(f) {
+  const form = $('#ed-form');
+  const { id } = parseRef(f.content);
+  form.content.value = 'Loading…';
+  form.content.readOnly = true;
+  try {
+    const a = await api.get(`${W()}/artifacts/${id}`);
+    const res = await fetch(`/w/${encodeURIComponent(S.ws)}/a/${id}/${a.entry}`, { credentials: 'same-origin' });
+    const text = await res.text();
+    if (S.editing !== f.id) return;
+    form.content.value = text;
+    form.dataset.artifact = id;
+    form.dataset.entry = a.entry;
+    form.dataset.orig = text;
+    const others = a.files.map((x) => x.path).filter((p) => p !== a.entry);
+    const pinned = parseRef(f.content).version;
+    $('#ed-art').replaceChildren(...[
+      h('span', {}, `Editing ${a.entry} of version ${a.latest}. Saving makes version ${a.latest + 1}.`),
+      others.length ? h('span', {}, ` Other files: ${others.join(', ')} (change those over MCP).`) : null,
+      pinned ? h('span', {}, ` This card is pinned to version ${pinned}.`) : null,
+      ' ', h('a', { href: artifactUrl(id), target: '_blank', rel: 'noopener' }, 'Open ↗'),
+    ].filter(Boolean));
+  } catch {
+    form.content.value = '';
+  } finally {
+    form.content.readOnly = false;
+  }
+}
+
 function closeEditor() { S.editing = null; $('#editor').hidden = true; }
 function kindChanged() {
   const k = $('#ed-form').kind.value;
   $('#ed-hint').textContent = HINTS[k] || '';
-  $('#ed-content-label').firstChild.textContent = k === 'url' ? 'URL ' : k === 'image' ? 'Image URL ' : 'Content ';
+  $('#ed-content-label').firstChild.textContent = k === 'url' ? 'URL ' : k === 'image' ? 'Image URL ' : k === 'artifact' ? 'Page HTML ' : 'Content ';
   $('#ed-content-label').hidden = k === 'folder';
 }
 function refreshEditorPlaceButton() {
@@ -877,6 +1005,7 @@ async function saveEditor(e) {
     tags: form.tags.value.split(',').map((t) => t.trim()).filter(Boolean),
     content: form.content.value,
   };
+  if (body.kind === 'artifact') return saveArtifact(form, body);
   if (S.editing === 'new') {
     const f = await api.post(`${W()}/findings`, { ...body, parent_id: form.dataset.parent || null, source: 'you' });
     if (form.place.checked && board()) await api.put(`${W()}/boards/${S.boardId}/placements`, [{ finding_id: f.id }]);
@@ -885,6 +1014,29 @@ async function saveEditor(e) {
     openEditor(f.id);
   } else {
     await api.patch(`${W()}/findings/${S.editing}`, body);
+  }
+}
+
+async function saveArtifact(form, body) {
+  if (S.editing === 'new') {
+    const out = await api.post(`${W()}/artifacts`, {
+      title: body.title, files: { 'index.html': body.content }, parent_id: form.dataset.parent || null,
+      category: body.category, tags: body.tags, source: 'you',
+      board_id: form.place.checked && board() ? S.boardId : null,
+    });
+    S.treeSel = out.finding.id;
+    await loadState();
+    openEditor(out.finding.id);
+    return;
+  }
+  await api.patch(`${W()}/findings/${S.editing}`, { title: body.title, category: body.category, tags: body.tags });
+  const id = form.dataset.artifact;
+  if (id && body.content !== form.dataset.orig) {
+    await api.post(`${W()}/artifacts/${id}/versions`, { files: { [form.dataset.entry]: body.content }, note: 'edited in Ritboard', source: 'you' });
+    form.dataset.orig = body.content;
+    await loadState();
+    const f = by.finding.get(S.editing);
+    if (f) loadArtifactIntoEditor(f);
   }
 }
 
@@ -920,7 +1072,7 @@ async function openSettings() {
   $('#set-dpr').textContent = `This screen reports devicePixelRatio ${window.devicePixelRatio}. Window is ${innerWidth}×${innerHeight} CSS px = ${Math.round(innerWidth * devicePixelRatio)}×${Math.round(innerHeight * devicePixelRatio)} device px.`;
   const mcp = `${location.origin}/mcp`;
   $('#set-mcp').textContent = mcp;
-  $('#set-cc').textContent = `claude mcp add --transport http ritbord ${mcp}`;
+  $('#set-cc').textContent = `claude mcp add --transport http ritboard ${mcp}`;
   try { $('#set-data').textContent = (await api.get('/api/info')).data_dir; } catch { /* offline */ }
   d.showModal();
 }
@@ -978,7 +1130,10 @@ function wire() {
   vp.addEventListener('pointerup', onPointerUp);
   vp.addEventListener('pointercancel', onPointerUp);
   vp.addEventListener('wheel', onWheel, { passive: false });
-  vp.addEventListener('dragover', (e) => { if (e.dataTransfer.types.includes('application/x-ritbord-finding')) { e.preventDefault(); e.dataTransfer.dropEffect = 'copy'; } });
+  vp.addEventListener('dragover', (e) => {
+    const t = e.dataTransfer.types;
+    if (t.includes('application/x-ritboard-finding') || t.includes('application/x-ritboard-artifact')) { e.preventDefault(); e.dataTransfer.dropEffect = 'copy'; }
+  });
   vp.addEventListener('drop', onDrop);
   vp.addEventListener('click', (e) => {
     const a = e.target.closest('.card-body a[href]');
@@ -1029,11 +1184,11 @@ function wire() {
   $$('.side-tabs button').forEach((b) => (b.onclick = () => { S.sideTab = b.dataset.tab; LS.set('sideTab', S.sideTab); renderSidebar(); }));
   $('#side-search').oninput = (e) => { S.filter = e.target.value; renderSidebar(); };
   const sb = $('#side-body');
-  sb.addEventListener('dragover', (e) => { if (e.dataTransfer.types.includes('application/x-ritbord-finding')) { e.preventDefault(); sb.classList.add('drop-root'); } });
+  sb.addEventListener('dragover', (e) => { if (e.dataTransfer.types.includes('application/x-ritboard-finding')) { e.preventDefault(); sb.classList.add('drop-root'); } });
   sb.addEventListener('dragleave', (e) => { if (e.target === sb) sb.classList.remove('drop-root'); });
   sb.addEventListener('drop', async (e) => {
     sb.classList.remove('drop-root');
-    const id = e.dataTransfer.getData('application/x-ritbord-finding');
+    const id = e.dataTransfer.getData('application/x-ritboard-finding');
     if (!id || S.sideTab !== 'tree') return;
     e.preventDefault();
     if (by.finding.get(id)?.parent_id) await api.patch(`${W()}/findings/${id}`, { parent_id: null });
