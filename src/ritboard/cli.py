@@ -9,6 +9,7 @@ import sys
 import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from pathlib import Path
 
@@ -175,6 +176,80 @@ def cmd_app(args) -> None:
     webview.start(private_mode=False)
 
 
+def _locate(args) -> tuple[str, str | None]:
+    """The running server's address and token, from --url/--token or <data>/server.json."""
+    import json
+
+    if args.url:
+        return args.url.rstrip("/"), args.token
+    try:
+        info = json.loads((args.data_dir / "server.json").read_text())
+        return info["url"], args.token or info.get("token")
+    except (OSError, ValueError, KeyError):
+        raise SystemExit(f"No running Ritboard found (no {args.data_dir / 'server.json'}). Start `ritboard serve`, or pass --url.")
+
+
+def cmd_import(args) -> None:
+    """Publish a local HTML file, or a folder of files, as an artifact on the running server."""
+    import base64
+    import json
+    import urllib.error
+
+    url, token = _locate(args)
+    src: Path = args.path
+    if not src.exists():
+        raise SystemExit(f"{src} does not exist")
+    if src.is_dir():
+        paths = [p for p in sorted(src.rglob("*")) if p.is_file()]
+        rel = {p: p.relative_to(src).as_posix() for p in paths}
+        entry = args.entry or "index.html"
+    else:
+        paths, rel = [src], {src: "index.html"}
+        entry = "index.html"
+    files, files_b64 = {}, {}
+    for p in paths:
+        data = p.read_bytes()
+        try:
+            files[rel[p]] = data.decode("utf-8")
+        except UnicodeDecodeError:
+            files_b64[rel[p]] = base64.b64encode(data).decode()
+    title = args.title or (src.stem if src.is_file() else src.name)
+
+    def call(method, path, body=None):
+        req = urllib.request.Request(url + path, method=method, data=None if body is None else json.dumps(body).encode())
+        req.add_header("Content-Type", "application/json")
+        if token:
+            req.add_header("Authorization", f"Bearer {token}")
+        try:
+            with urllib.request.urlopen(req, timeout=60) as r:
+                text = r.read()
+                return json.loads(text) if text else None
+        except urllib.error.HTTPError as e:
+            detail = e.read().decode(errors="replace")
+            raise SystemExit(f"{method} {path} failed ({e.code}): {detail}")
+
+    ws = args.workspace
+    out = call("POST", f"/api/w/{ws}/artifacts", {
+        "title": title, "files": files, "files_b64": files_b64, "entry": entry, "source": "import",
+        "add_card": not args.card, "board_id": args.board,
+    })
+    aid = out["artifact"]["id"]
+    if args.card:
+        call("PATCH", f"/api/w/{ws}/findings/{args.card}", {"kind": "artifact", "content": aid})
+    n = 0
+    if args.data:
+        # {"collection": [{"id": "...", "data": {...}}, ...], ...}
+        for coll, docs in json.loads(Path(args.data).read_text(encoding="utf-8")).items():
+            for d in docs:
+                q = urllib.parse.urlencode({"c": coll, "id": d["id"]})
+                call("PUT", f"/w/{ws}/a/{aid}/_db/doc?{q}", d["data"])
+                n += 1
+    print(f"Published {title!r} as {aid} ({len(paths)} file(s)) in {ws}"
+          + (f", card {args.card} now shows it" if args.card else "")
+          + (f", {n} database document(s) imported" if n else ""))
+    print(f"  {url}/w/{ws}/a/{aid}/")
+
+
 def cmd_mcp(args) -> None:
     import asyncio
     import json
@@ -222,8 +297,21 @@ def main(argv: list[str] | None = None) -> None:
     m.add_argument("--data", type=Path, default=default_data_dir(), help="data folder of the server to find")
     m.set_defaults(func=cmd_mcp)
 
+    i = sub.add_parser("import", help="publish a local HTML file or folder as an artifact on the running server")
+    i.add_argument("path", type=Path, help="an .html file, or a folder with index.html and its other files")
+    i.add_argument("--workspace", "-w", required=True)
+    i.add_argument("--title")
+    i.add_argument("--entry", help="entry page inside a folder (default index.html)")
+    i.add_argument("--board", help="also place a new card on this board (id or name)")
+    i.add_argument("--card", help="turn this existing card (finding id) into the artifact card instead of adding one")
+    i.add_argument("--data", help='JSON file with database documents: {"collection": [{"id": ..., "data": {...}}]}')
+    i.add_argument("--url", default=os.environ.get("RITBOARD_URL"))
+    i.add_argument("--token", default=os.environ.get("RITBOARD_TOKEN"))
+    i.add_argument("--data-dir", dest="data_dir", type=Path, default=default_data_dir())
+    i.set_defaults(func=cmd_import)
+
     argv = list(sys.argv[1:] if argv is None else argv)
-    if not argv or argv[0] not in ("serve", "app", "mcp", "-h", "--help"):
+    if not argv or argv[0] not in ("serve", "app", "mcp", "import", "-h", "--help"):
         argv.insert(0, "serve")
     args = ap.parse_args(argv)
     args.func(args)

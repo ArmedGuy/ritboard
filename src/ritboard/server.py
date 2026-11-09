@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import contextlib
 import hmac
 import json
@@ -144,7 +145,8 @@ def inject_runtime(html: bytes, src: str) -> bytes:
 
 class ArtifactCreate(BaseModel):
     title: str
-    files: dict[str, str]
+    files: dict[str, str] = {}
+    files_b64: dict[str, str] = {}  # binary files, base64
     entry: str = "index.html"
     description: str = ""
     source: str | None = None
@@ -361,7 +363,9 @@ def create_app(cfg: Config) -> FastAPI:
     @app.post("/api/w/{ws}/artifacts")
     async def create_artifact(ws: str, body: ArtifactCreate):
         st = reg.get(ws)
-        a = st.create_artifact(body.title, {p: c.encode() for p, c in body.files.items()}, body.entry, body.description, body.source)
+        files = {p: c.encode() for p, c in body.files.items()}
+        files.update({p: base64.b64decode(c) for p, c in body.files_b64.items()})
+        a = st.create_artifact(body.title, files, body.entry, body.description, body.source)
         out: dict[str, Any] = {"artifact": a}
         if body.add_card:
             f = st.add_finding(body.title, a["id"], "artifact", body.parent_id, body.category, body.tags, body.source)

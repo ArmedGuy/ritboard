@@ -132,6 +132,17 @@ scripts, styles, data and images. Every publish is a numbered version, kept whol
   ＋ Finding → kind Artifact, edit its `index.html` from the card, and manage them in the
   Artifacts tab, where you can drag one onto the board.
 
+To bring in a page from elsewhere, an HTML file or a folder with `index.html`:
+
+```sh
+uv run ritboard import page.html -w my-workspace --title "My page"
+uv run ritboard import site_folder -w my-workspace --board Main
+uv run ritboard import page.html -w my-workspace --card f_xxxxxxxx --data docs.json
+```
+
+`--card` turns an existing card into the artifact card, keeping its place on the boards.
+`--data` loads database documents: `{"collection": [{"id": "...", "data": {...}}]}`.
+
 Claude artifacts (claude.ai links) are not supported: claude.ai refuses to be shown inside
 other pages. Ritboard rejects `url` cards that point at claude.ai or claude.site with a
 message telling the agent to publish the HTML as a Ritboard artifact instead. Older cards

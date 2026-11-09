@@ -6,3 +6,5 @@ dist/
 *.sqlite
 *.sqlite-wal
 *.sqlite-shm
+
+_import/
