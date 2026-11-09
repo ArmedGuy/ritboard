@@ -166,3 +166,24 @@ def test_token_gate_lets_artifact_pages_through(tmp_path):
     finally:
         srv.should_exit = True
         t.join(5)
+
+
+def test_host_guard(server):
+    # A page on another site, pointed at 127.0.0.1 by DNS rebinding, sends its own Host.
+    r = httpx.get(server + "/api/workspaces", headers={"Host": "evil.example"})
+    assert r.status_code == 421
+    assert httpx.get(server + "/api/workspaces", headers={"Host": "localhost:1234"}).status_code == 200
+
+    async def ws_from(origin):
+        try:
+            async with websockets.connect(server.replace("http", "ws") + "/ws", origin=origin) as s:
+                await s.send(json.dumps({"subscribe": "x"}))
+                await asyncio.wait_for(s.recv(), 0.5)
+        except asyncio.TimeoutError:
+            return "open"
+        except Exception as e:
+            return type(e).__name__
+        return "open"
+
+    assert asyncio.run(ws_from("http://evil.example")) != "open"
+    assert asyncio.run(ws_from(server)) == "open"

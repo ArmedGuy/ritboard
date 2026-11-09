@@ -107,6 +107,9 @@ def cmd_serve(args) -> None:
 
     if args.host not in ("127.0.0.1", "localhost", "::1") and not args.token:
         print("warning: listening beyond localhost without --token; anyone on the network can edit boards", file=sys.stderr)
+    if args.host not in ("127.0.0.1", "localhost", "::1") and not args.allowed_hosts:
+        print("note: pass --allowed-host <name:port> for each name the board is reached by, so other sites "
+              "can't reach it through DNS rebinding", file=sys.stderr)
     print(f"Ritboard on http://{args.host}:{args.port}  MCP: http://{args.host}:{args.port}/mcp  data: {args.data}")
     if args.dev:
         # Restart on Python changes; open browsers reload on UI changes.

@@ -143,7 +143,7 @@ with their path, SHA-256 and size. The artifact is published at once, and the re
 one PUT link per waiting file:
 
 ```sh
-curl -sS -T data/grid.bin "http://127.0.0.1:5170/w/<ws>/u/<secret>/<sha256>"
+curl -sS -T data/grid.bin "http://127.0.0.1:8765/w/<ws>/u/<secret>/<sha256>"
 ```
 
 Ritboard checks the hash and size, and the file appears in the page as soon as it arrives.

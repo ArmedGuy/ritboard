@@ -187,6 +187,45 @@ class ArtifactUpdate(BaseModel):
     source: str | None = None
 
 
+def _host_only(value: str) -> str:
+    """'127.0.0.1:8765' -> '127.0.0.1', '[::1]:80' -> '::1', 'Board.LAN' -> 'board.lan'."""
+    v = value.strip().lower()
+    if v.startswith("["):
+        return v[1:].split("]", 1)[0]
+    return v.rsplit(":", 1)[0] if v.count(":") == 1 else v
+
+
+class HostGuard:
+    """Refuse requests whose Host header isn't one this server is meant to be reached by.
+
+    Without this, a web page could point its own domain at 127.0.0.1 (DNS rebinding) and then
+    use the board API from the browser. WebSocket handshakes must also come from a page on an
+    allowed host, since browsers don't apply CORS to them."""
+
+    def __init__(self, app: ASGIApp, hosts: set[str]):
+        self.app = app
+        self.hosts = hosts
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] not in ("http", "websocket"):
+            return await self.app(scope, receive, send)
+        headers = {k.decode().lower(): v.decode() for k, v in scope.get("headers", [])}
+        ok = _host_only(headers.get("host", "")) in self.hosts
+        origin = headers.get("origin")
+        if ok and scope["type"] == "websocket" and origin:
+            from urllib.parse import urlsplit
+
+            ok = (urlsplit(origin).hostname or "").lower() in self.hosts
+        if ok:
+            return await self.app(scope, receive, send)
+        if scope["type"] == "websocket":
+            await send({"type": "websocket.close", "code": 4403})
+            return
+        body = b'{"detail": "this server does not answer to that host name; see --allowed-host"}'
+        await send({"type": "http.response.start", "status": 421, "headers": [(b"content-type", b"application/json")]})
+        await send({"type": "http.response.body", "body": body})
+
+
 class TokenGate:
     """Optional shared-token check for LAN use. Accepts a Bearer header, a cookie,
     or ?token= (which also sets the cookie so the browser UI keeps working)."""
@@ -571,4 +610,8 @@ def create_app(cfg: Config) -> FastAPI:
 
     app.mount("/static", StaticFiles(directory=STATIC), name="static")
 
-    return TokenGate(app, cfg.token) if cfg.token else app  # type: ignore[return-value]
+    outer: ASGIApp = TokenGate(app, cfg.token) if cfg.token else app
+    hosts = {"localhost", "127.0.0.1", "::1"} | {_host_only(h) for h in cfg.allowed_hosts}
+    if cfg.host in LOCAL_HOSTS or cfg.allowed_hosts:
+        outer = HostGuard(outer, hosts)
+    return outer  # type: ignore[return-value]
