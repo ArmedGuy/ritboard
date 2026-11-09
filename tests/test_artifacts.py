@@ -136,3 +136,49 @@ def test_artifact_database(server):  # noqa: F811
             assert httpx.put(base + "/doc", params={"c": "../x", "id": "a"}, json={}).status_code == 400
 
     asyncio.run(run())
+
+
+def test_shadow_files_and_upload_links(server):  # noqa: F811
+    import hashlib
+
+    big = bytes(range(256)) * 2000  # 512 KB, binary
+    h = hashlib.sha256(big).hexdigest()
+
+    async def run():
+        async with Client(server + "/mcp") as c:
+            ws = data(await c.call_tool("create_workspace", {"name": "Uploads"}))["workspace"]["id"]
+            out = data(await c.call_tool("publish_artifact", {
+                "workspace": ws, "title": "Grid", "html": "<script src=grid.bin></script>",
+                "shadow_files": [{"path": "grid.bin", "sha256": h, "size": len(big)},
+                                 {"path": "copy/grid.bin", "sha256": h, "size": len(big)}],
+            }))
+            a = out["artifact"]
+            assert a["pending"] == 2
+            waiting = a["uploads"]["waiting"]
+            assert len(waiting) == 2 and "curl" in waiting[0] and "note" in waiting[1]
+            url = waiting[0]["put_url"]
+            assert httpx.get(f"{server}/w/{ws}/a/{a['id']}/grid.bin").status_code == 404
+
+            bad = httpx.put(url, content=b"nope")
+            assert bad.status_code == 400 and "does not match" in bad.json()["detail"]
+            ok = httpx.put(url, content=big).json()
+            assert sorted(ok["stored"]) == ["copy/grid.bin", "grid.bin"] and ok["still_waiting"] == 0
+            assert httpx.get(f"{server}/w/{ws}/a/{a['id']}/copy/grid.bin").content == big
+
+            # A new publish replaces the links; the same content needs no upload.
+            v2 = data(await c.call_tool("update_artifact", {
+                "workspace": ws, "artifact_id": a["id"],
+                "shadow_files": [{"path": "again.bin", "sha256": h, "size": len(big)},
+                                 {"path": "tiny.bin", "sha256": hashlib.sha256(b"t").hexdigest(), "size": 1}],
+            }))
+            assert v2["pending"] == 1 and [w["path"] for w in v2["uploads"]["waiting"]] == ["tiny.bin"]
+            assert httpx.put(url, content=big).status_code == 404  # old link is dead
+            new_url = v2["uploads"]["waiting"][0]["put_url"]
+            assert httpx.put(new_url, content=b"t").json()["still_waiting"] == 0
+
+            links = data(await c.call_tool("upload_links", {"workspace": ws, "artifact_id": a["id"]}))
+            assert links["waiting"] == []
+            renewed = data(await c.call_tool("upload_links", {"workspace": ws, "artifact_id": a["id"], "renew": True}))
+            assert renewed["waiting"] == []
+
+    asyncio.run(run())

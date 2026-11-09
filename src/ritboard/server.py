@@ -25,7 +25,7 @@ from .mcp_tools import build_mcp
 from .store import Conflict, NotFound, Registry, parse_artifact_ref
 
 STATIC = Path(__file__).parent / "static"
-ARTIFACT_PATH = re.compile(r"^/w/[^/]+/a/")
+ARTIFACT_PATH = re.compile(r"^/w/[^/]+/(a|u)/")  # artifact pages and upload links
 # Served artifact pages get a throwaway origin even when opened full-window, so their
 # scripts can't call Ritboard's API. allow-same-origin is deliberately absent.
 ARTIFACT_CSP = (
@@ -480,6 +480,12 @@ def create_app(cfg: Config) -> FastAPI:
             "Cache-Control": "public, max-age=31536000, immutable" if version else "no-cache",
         }
         return Response(data, media_type=ctype, headers=headers)
+
+    # Upload links for shadow files: the secret in the path is the authorisation.
+    @app.put("/w/{ws}/u/{token}/{digest}")
+    @app.post("/w/{ws}/u/{token}/{digest}")
+    async def upload_shadow(ws: str, token: str, digest: str, request: Request):
+        return reg.get(ws).receive_upload(token, digest, await request.body())
 
     # ---- live updates -------------------------------------------------
     @app.websocket("/ws")

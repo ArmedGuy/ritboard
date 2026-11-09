@@ -372,7 +372,8 @@ function artifactLabel(f) {
   const { id, version } = parseRef(f.content);
   const a = by.artifact.get(id);
   if (!a) return 'artifact ?';
-  return version ? `v${version} of ${a.latest} · pinned` : `artifact v${a.latest}`;
+  const label = version ? `v${version} of ${a.latest} · pinned` : `artifact v${a.latest}`;
+  return a.pending && !version ? `${label} · ${a.pending} file${a.pending > 1 ? 's' : ''} on the way` : label;
 }
 
 // claude.ai links are refused when posted now; cards made before that show a note instead of a blank frame.

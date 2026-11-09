@@ -54,7 +54,7 @@ def test_mcp_flow_with_live_push(server):
             async with Client(server + "/mcp") as c:
                 names = {t.name for t in (await c.list_tools()).tools}
                 assert {"add_finding", "place_findings", "create_board"} <= names
-                assert not any("link" in n for n in names)
+                assert not {"link_findings", "unlink", "update_link"} & names
 
                 ws = data(await c.call_tool("create_workspace", {"name": "GPU perf"}))
                 wid = ws["workspace"]["id"]
@@ -162,6 +162,7 @@ def test_token_gate_lets_artifact_pages_through(tmp_path):
         assert httpx.get(f"{url}/w/{ws}/a/{aid}/").text.endswith("ok")
         assert httpx.put(f"{url}/w/{ws}/a/{aid}/_db/doc", params={"c": "p", "id": "d"}, json={"a": 1}).status_code == 200
         assert httpx.get(f"{url}/api/w/{ws}/artifacts").status_code == 401
+        assert httpx.put(f"{url}/w/{ws}/u/notatoken/{'0' * 64}", content=b"x").status_code == 404  # reached the app, not 401
     finally:
         srv.should_exit = True
         t.join(5)

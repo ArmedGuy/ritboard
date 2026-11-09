@@ -34,6 +34,10 @@ Model:
   `collection.add()`, `collection.get()` and `collection.onSnapshot(snap => snap.docChanges())`.
   Other claude.ai capabilities (window.claude.complete, user, assets) don't exist here.
   Agents read and write the same data with artifact_data.
+- Big files: don't put large or binary content in publish_artifact/update_artifact. List
+  them in shadow_files (path, sha256, size); the reply gives one PUT link per file. Send each
+  with curl -T from your shell. Hashes are checked; files appear as they arrive. Each
+  publish replaces the links; upload_links gives them again.
 - Never post claude.ai or claude.site links (Claude artifacts) as url cards; they are refused,
   because claude.ai can't be shown inside another page. Publish the artifact's HTML with
   publish_artifact instead: get the HTML (from your own output, or by reading the artifact)
@@ -64,6 +68,12 @@ class PlacementIn(BaseModel):
     w: int | None = Field(None, description="Width in pixels. Default depends on kind.")
     h: int | None = Field(None, description="Height in pixels.")
     z: int | None = Field(None, description="Stacking order; higher is on top.")
+
+
+class ShadowFile(BaseModel):
+    path: str = Field(description="Relative path, e.g. data/grid.bin")
+    sha256: str = Field(description="SHA-256 of the file, 64 hex characters")
+    size: int = Field(description="Size in bytes")
 
 
 class ArtifactFile(BaseModel):
@@ -105,11 +115,32 @@ def build_mcp(reg: Registry, ui_state: dict[str, Any], base_url: str = "") -> MC
     def art_url(ws: str, aid: str, version: int | None = None) -> str:
         return f"{base_url}/w/{ws}/a/{aid}{'@' + str(version) if version else ''}/"
 
-    def art_out(ws: str, a: dict[str, Any]) -> dict[str, Any]:
+    def art_out(ws: str, a: dict[str, Any], links: bool = True) -> dict[str, Any]:
         a = {k: v for k, v in a.items() if k != "versions"}
         a["url"] = art_url(ws, a["id"])
         a["version_url"] = art_url(ws, a["id"], a["latest"])
+        if links and a.get("pending"):
+            a["uploads"] = upload_out(ws, reg.get(ws).upload_links(a["id"]))
         return a
+
+    def upload_out(ws: str, links: dict[str, Any]) -> dict[str, Any]:
+        files, seen = [], set()
+        for f in links["pending"]:
+            url = f"{base_url}/w/{ws}/u/{links['token']}/{f['sha256']}"
+            item = {"path": f["path"], "size": f["size"], "put_url": url}
+            if f["sha256"] in seen:
+                item["note"] = "same content as another waiting file; one PUT fills both"
+            else:
+                item["curl"] = f'curl -sS -T "{f["path"]}" "{url}"'
+                seen.add(f["sha256"])
+            files.append(item)
+        return {
+            "waiting": files,
+            "expires_in_minutes": links["expires_in_minutes"],
+            "how": "PUT each file's bytes to its put_url (curl -T; in PowerShell use curl.exe). The hash and size "
+                   "are checked. The page shows each file as soon as it arrives. These links stop working "
+                   "at the next publish of this artifact.",
+        }
 
     def _overview(ws: str) -> dict[str, Any]:
         st = reg.get(ws)
@@ -339,6 +370,7 @@ def build_mcp(reg: Registry, ui_state: dict[str, Any], base_url: str = "") -> MC
         title: str,
         html: str | None = None,
         files: list[ArtifactFile] | None = None,
+        shadow_files: list[ShadowFile] | None = None,
         entry: str = "index.html",
         description: str = "",
         source: str | None = None,
@@ -354,9 +386,13 @@ def build_mcp(reg: Registry, ui_state: dict[str, Any], base_url: str = "") -> MC
     ) -> dict[str, Any]:
         """Publish a new artifact: a page or small site kept in this workspace, version 1.
         Give `html` for a single page (saved as index.html), or `files` for several files.
+        For big files (over ~50 KB, or binary) list them in `shadow_files` with path, sha256
+        and size instead: the reply has a PUT link for each, to send with curl so the bytes
+        don't pass through this conversation.
         By default it also adds a card for it to the tree; give board_id to place that card."""
         st = reg.get(workspace)
-        a = st.create_artifact(title, _decode(files, html), entry, description, source)
+        shadows = {s.path: s.model_dump() for s in shadow_files or []}
+        a = st.create_artifact(title, _decode(files, html), entry, description, source, shadows=shadows)
         out: dict[str, Any] = {"artifact": art_out(st.id, a)}
         if add_card:
             f = st.add_finding(title, a["id"], "artifact", parent_id, category, tags, source)
@@ -371,6 +407,7 @@ def build_mcp(reg: Registry, ui_state: dict[str, Any], base_url: str = "") -> MC
         artifact_id: str,
         html: str | None = None,
         files: list[ArtifactFile] | None = None,
+        shadow_files: list[ShadowFile] | None = None,
         remove: list[str] | None = None,
         note: str = "",
         title: str | None = None,
@@ -380,9 +417,14 @@ def build_mcp(reg: Registry, ui_state: dict[str, Any], base_url: str = "") -> MC
     ) -> dict[str, Any]:
         """Make a new version of an artifact. It starts from the latest files; given files are
         added or replaced, `remove` deletes paths. `html` replaces index.html. Every card
-        showing the artifact reloads. Title/description changes alone don't add a version."""
+        showing the artifact reloads. Title/description changes alone don't add a version.
+        `shadow_files` (path, sha256, size) register big files to send afterwards with curl;
+        the reply has their PUT links. Each publish replaces the upload links."""
         st = reg.get(workspace)
-        a = st.update_artifact(artifact_id, _decode(files, html), remove, note, title, description, entry, source)
+        shadows = {s.path: s.model_dump() for s in shadow_files or []}
+        a = st.update_artifact(
+            artifact_id, _decode(files, html), remove, note, title, description, entry, source, shadows=shadows
+        )
         return art_out(st.id, a)
 
     @tool
@@ -399,7 +441,14 @@ def build_mcp(reg: Registry, ui_state: dict[str, Any], base_url: str = "") -> MC
     async def list_artifacts(workspace: str) -> dict[str, Any]:
         """All artifacts in a workspace: id, title, latest version, file count, size, address."""
         st = reg.get(workspace)
-        return {"artifacts": [art_out(st.id, a) for a in st.list_artifacts()]}
+        return {"artifacts": [art_out(st.id, a, links=False) for a in st.list_artifacts()]}
+
+    @tool
+    async def upload_links(workspace: str, artifact_id: str, renew: bool = False) -> dict[str, Any]:
+        """PUT links for an artifact's shadow files that haven't arrived yet. renew=true makes
+        new links (needed once they expire; old ones stop working)."""
+        st = reg.get(workspace)
+        return upload_out(st.id, st.upload_links(artifact_id, rotate=renew))
 
     @tool
     async def artifact_data(

@@ -7,6 +7,7 @@ A placement puts a finding on one board at exact pixel coordinates.
 from __future__ import annotations
 
 import base64
+import hashlib
 import json
 import mimetypes
 import re
@@ -42,7 +43,8 @@ DEFAULT_SIZES = {
     "artifact": (800, 600),
 }
 
-ARTIFACT_MAX_BYTES = 16 * 1024 * 1024  # per version, all files together
+ARTIFACT_MAX_BYTES = 64 * 1024 * 1024  # per version, all files together
+UPLOAD_TTL_SECONDS = 4 * 3600  # how long upload links work after a publish
 DOC_MAX_BYTES = 1024 * 1024  # one artifact database document
 _SEGMENT = re.compile(r"^[A-Za-z0-9_\-.~:@+]{1,200}$")
 
@@ -107,7 +109,15 @@ CREATE TABLE IF NOT EXISTS artifact_files (
     path TEXT NOT NULL,
     content BLOB NOT NULL,
     content_type TEXT NOT NULL,
+    sha256 TEXT,
+    size INTEGER,
+    pending INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (artifact_id, version, path)
+);
+CREATE TABLE IF NOT EXISTS artifact_upload (
+    artifact_id TEXT PRIMARY KEY REFERENCES artifacts(id) ON DELETE CASCADE,
+    token TEXT NOT NULL UNIQUE,
+    expires REAL NOT NULL
 );
 CREATE TABLE IF NOT EXISTS artifact_docs (
     artifact_id TEXT NOT NULL REFERENCES artifacts(id) ON DELETE CASCADE,
@@ -231,6 +241,14 @@ class WorkspaceStore:
         self.db.execute("PRAGMA journal_mode=WAL")
         self.db.execute("PRAGMA foreign_keys=ON")
         self.db.executescript(SCHEMA)
+        self._migrate()
+
+    def _migrate(self) -> None:
+        """Bring files made by older versions of Ritboard up to the current schema."""
+        cols = {r["name"] for r in self.db.execute("PRAGMA table_info(artifact_files)")}
+        for col, decl in (("sha256", "TEXT"), ("size", "INTEGER"), ("pending", "INTEGER NOT NULL DEFAULT 0")):
+            if col not in cols:
+                self.db.execute(f"ALTER TABLE artifact_files ADD COLUMN {col} {decl}")
 
     # ---- plumbing -------------------------------------------------------
     def close(self) -> None:
@@ -646,6 +664,11 @@ class WorkspaceStore:
     # ---- artifacts ------------------------------------------------------
     # An artifact is a small website kept in this workspace: an entry page plus any other
     # files, stored whole for every version. Cards of kind "artifact" point at one by id.
+    #
+    # Big files can be registered as shadow files: path, SHA-256 and size, no content. The
+    # version is published at once; each shadow file gets a PUT link and fills in when its
+    # bytes arrive (checked against the hash). The links carry an upload secret that is
+    # replaced on every publish, so only links from the latest publish work.
 
     def _check_artifact_ref(self, ref: str) -> str:
         aid, ver = parse_artifact_ref(ref)
@@ -663,7 +686,9 @@ class WorkspaceStore:
     def list_artifacts(self) -> list[dict[str, Any]]:
         rows = self._q(
             "SELECT a.*, (SELECT COUNT(*) FROM artifact_files f WHERE f.artifact_id=a.id AND f.version=a.latest) files,"
-            " (SELECT COALESCE(SUM(LENGTH(content)),0) FROM artifact_files f WHERE f.artifact_id=a.id AND f.version=a.latest) bytes"
+            " (SELECT COALESCE(SUM(COALESCE(f.size, LENGTH(f.content))),0) FROM artifact_files f"
+            "  WHERE f.artifact_id=a.id AND f.version=a.latest) bytes,"
+            " (SELECT COUNT(*) FROM artifact_files f WHERE f.artifact_id=a.id AND f.version=a.latest AND f.pending=1) pending"
             " FROM artifacts a ORDER BY a.updated_at DESC"
         )
         return [dict(r) for r in rows]
@@ -675,10 +700,16 @@ class WorkspaceStore:
             raise NotFound(f"artifact {aid} has no version {v}")
         files = []
         for r in self._q(
-            "SELECT path, content, content_type FROM artifact_files WHERE artifact_id=? AND version=? ORDER BY path", (aid, v)
+            "SELECT path, content, content_type, sha256, size, pending FROM artifact_files"
+            " WHERE artifact_id=? AND version=? ORDER BY path", (aid, v)
         ):
-            f: dict[str, Any] = {"path": r["path"], "content_type": r["content_type"], "size": len(r["content"])}
-            if with_content:
+            f: dict[str, Any] = {
+                "path": r["path"], "content_type": r["content_type"],
+                "size": r["size"] if r["size"] is not None else len(r["content"]),
+            }
+            if r["pending"]:
+                f.update(pending=True, sha256=r["sha256"])
+            elif with_content:
                 if r["content_type"].startswith("text/") or "json" in r["content_type"] or "svg" in r["content_type"]:
                     f["content"], f["encoding"] = bytes(r["content"]).decode("utf-8", "replace"), "text"
                 else:
@@ -687,33 +718,104 @@ class WorkspaceStore:
         versions = [dict(r) for r in self._q(
             "SELECT version, note, source, created_at FROM artifact_versions WHERE artifact_id=? ORDER BY version", (aid,)
         )]
-        return {**a, "version": v, "files": files, "versions": versions}
+        return {**a, "version": v, "files": files, "versions": versions, "pending": sum(1 for f in files if f.get("pending"))}
 
     def artifact_file(self, aid: str, version: int | None, path: str) -> tuple[bytes, str]:
         a = self.artifact_meta(aid)
         v = version or a["latest"]
         rows = self._q(
-            "SELECT content, content_type FROM artifact_files WHERE artifact_id=? AND version=? AND path=?",
+            "SELECT content, content_type, pending FROM artifact_files WHERE artifact_id=? AND version=? AND path=?",
             (aid, v, path or a["entry"]),
         )
         if not rows:
             raise NotFound(f"{path or a['entry']} not in artifact {aid} v{v}")
+        if rows[0]["pending"]:
+            raise NotFound(f"{path or a['entry']} has not been uploaded yet")
         return bytes(rows[0]["content"]), rows[0]["content_type"]
 
+    @staticmethod
+    def _shadow(item: Any) -> tuple[str, int]:
+        h = str(item.get("sha256", "")).lower()
+        if not re.fullmatch(r"[0-9a-f]{64}", h):
+            raise ValueError("a shadow file needs sha256 as 64 hex characters")
+        size = int(item.get("size", -1))
+        if size < 0:
+            raise ValueError("a shadow file needs its size in bytes")
+        return h, size
+
     def _write_version(
-        self, db, aid: str, version: int, files: dict[str, bytes], note: str, source: str | None
+        self,
+        db,
+        aid: str,
+        version: int,
+        files: dict[str, bytes],
+        note: str,
+        source: str | None,
+        shadows: dict[str, tuple[str, int]] | None = None,
     ) -> None:
-        total = sum(len(b) for b in files.values())
+        shadows = shadows or {}
+        total = sum(len(b) for b in files.values()) + sum(s for _, s in shadows.values())
         if total > ARTIFACT_MAX_BYTES:
             raise ValueError(f"artifact is {total} bytes; the limit is {ARTIFACT_MAX_BYTES}")
         db.execute(
             "INSERT INTO artifact_versions(artifact_id,version,note,source,created_at) VALUES(?,?,?,?,?)",
             (aid, version, note or "", source, now()),
         )
+        rows = [
+            (aid, version, path, sqlite3.Binary(data), content_type(path), hashlib.sha256(data).hexdigest(), len(data), 0)
+            for path, data in files.items()
+        ]
+        rows += [(aid, version, path, b"", content_type(path), h, size, 1) for path, (h, size) in shadows.items()]
         db.executemany(
-            "INSERT INTO artifact_files(artifact_id,version,path,content,content_type) VALUES(?,?,?,?,?)",
-            [(aid, version, path, sqlite3.Binary(data), content_type(path)) for path, data in files.items()],
+            "INSERT INTO artifact_files(artifact_id,version,path,content,content_type,sha256,size,pending)"
+            " VALUES(?,?,?,?,?,?,?,?)",
+            rows,
         )
+
+    def _rotate_upload(self, db, aid: str) -> str:
+        token = secrets.token_urlsafe(24)
+        db.execute(
+            "INSERT INTO artifact_upload(artifact_id, token, expires) VALUES(?,?,?)"
+            " ON CONFLICT(artifact_id) DO UPDATE SET token=excluded.token, expires=excluded.expires",
+            (aid, token, time.time() + UPLOAD_TTL_SECONDS),
+        )
+        return token
+
+    def upload_links(self, aid: str, rotate: bool = False) -> dict[str, Any]:
+        """The current upload secret and the files still waiting for it. rotate=True replaces
+        the secret, which also renews an expired one."""
+        self.artifact_meta(aid)
+        with self._tx() as db:
+            row = db.execute("SELECT token, expires FROM artifact_upload WHERE artifact_id=?", (aid,)).fetchone()
+            if rotate or not row or row["expires"] < time.time():
+                token, expires = self._rotate_upload(db, aid), time.time() + UPLOAD_TTL_SECONDS
+            else:
+                token, expires = row["token"], row["expires"]
+        a = self.get_artifact(aid)
+        return {
+            "token": token,
+            "expires_in_minutes": max(0, int((expires - time.time()) / 60)),
+            "pending": [{"path": f["path"], "sha256": f["sha256"], "size": f["size"]} for f in a["files"] if f.get("pending")],
+        }
+
+    def _fill_from_existing(self, db, aid: str, version: int) -> list[str]:
+        """Shadow files whose content the artifact already has (any version) are filled at once."""
+        filled = []
+        pending = db.execute(
+            "SELECT path, sha256, size FROM artifact_files WHERE artifact_id=? AND version=? AND pending=1", (aid, version)
+        ).fetchall()
+        for p in pending:
+            src = db.execute(
+                "SELECT content FROM artifact_files WHERE artifact_id=? AND sha256=? AND pending=0 LIMIT 1",
+                (aid, p["sha256"]),
+            ).fetchone()
+            if src and len(src["content"]) == p["size"]:
+                db.execute(
+                    "UPDATE artifact_files SET content=?, pending=0 WHERE artifact_id=? AND version=? AND path=?",
+                    (src["content"], aid, version, p["path"]),
+                )
+                filled.append(p["path"])
+        return filled
 
     def create_artifact(
         self,
@@ -723,11 +825,15 @@ class WorkspaceStore:
         description: str = "",
         source: str | None = None,
         note: str = "",
+        shadows: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         files = {clean_path(p): b for p, b in files.items()}
+        shadow = {clean_path(p): self._shadow(s) for p, s in (shadows or {}).items()}
+        if set(files) & set(shadow):
+            raise ValueError(f"given both with content and as a shadow file: {', '.join(sorted(set(files) & set(shadow)))}")
         entry = clean_path(entry)
-        if entry not in files:
-            raise ValueError(f"the entry file {entry} is missing; files given: {', '.join(files) or 'none'}")
+        if entry not in files and entry not in shadow:
+            raise ValueError(f"the entry file {entry} is missing; files given: {', '.join([*files, *shadow]) or 'none'}")
         aid = new_id("a", 16)  # long: artifact pages are served without the token
         t = now()
         with self._tx() as db:
@@ -735,7 +841,9 @@ class WorkspaceStore:
                 "INSERT INTO artifacts(id,title,description,entry,latest,source,created_at,updated_at) VALUES(?,?,?,?,1,?,?,?)",
                 (aid, title, description or "", entry, source, t, t),
             )
-            self._write_version(db, aid, 1, files, note or "first version", source)
+            self._write_version(db, aid, 1, files, note or "first version", source, shadow)
+            self._fill_from_existing(db, aid, 1)
+            self._rotate_upload(db, aid)
         self.changed("artifacts")
         return self.get_artifact(aid)
 
@@ -749,11 +857,16 @@ class WorkspaceStore:
         description: str | None = None,
         entry: str | None = None,
         source: str | None = None,
+        shadows: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
-        """New version = latest files, plus/overwritten by `files`, minus `remove`.
+        """New version = latest files (shadow files still waiting carry over), plus/overwritten by
+        `files` and `shadows`, minus `remove`. Every publish replaces the upload secret.
         Changing only title/description doesn't make a new version."""
         a = self.artifact_meta(aid)
         new_files = {clean_path(p): b for p, b in (files or {}).items()}
+        new_shadow = {clean_path(p): self._shadow(s) for p, s in (shadows or {}).items()}
+        if set(new_files) & set(new_shadow):
+            raise ValueError("a path is given both with content and as a shadow file")
         drop = {clean_path(p) for p in (remove or [])}
         entry = clean_path(entry) if entry else a["entry"]
         with self._tx() as db:
@@ -762,32 +875,78 @@ class WorkspaceStore:
                 sets["title"] = title
             if description is not None:
                 sets["description"] = description
-            if new_files or drop or entry != a["entry"]:
-                cur = {
-                    r["path"]: bytes(r["content"])
-                    for r in db.execute(
-                        "SELECT path, content FROM artifact_files WHERE artifact_id=? AND version=?", (aid, a["latest"])
-                    )
-                }
-                missing = drop - set(cur)
+            if new_files or new_shadow or drop or entry != a["entry"]:
+                content: dict[str, bytes] = {}
+                shadow: dict[str, tuple[str, int]] = {}
+                for r in db.execute(
+                    "SELECT path, content, sha256, size, pending FROM artifact_files WHERE artifact_id=? AND version=?",
+                    (aid, a["latest"]),
+                ):
+                    if r["pending"]:
+                        shadow[r["path"]] = (r["sha256"], r["size"])
+                    else:
+                        content[r["path"]] = bytes(r["content"])
+                missing = drop - set(content) - set(shadow)
                 if missing:
                     raise ValueError(f"not in the artifact: {', '.join(sorted(missing))}")
-                merged = {p: b for p, b in cur.items() if p not in drop}
-                merged.update(new_files)
-                if entry not in merged:
+                for p in drop | set(new_files) | set(new_shadow):
+                    content.pop(p, None)
+                    shadow.pop(p, None)
+                content.update(new_files)
+                shadow.update(new_shadow)
+                if entry not in content and entry not in shadow:
                     raise ValueError(f"the entry file {entry} would be missing")
                 v = a["latest"] + 1
-                self._write_version(db, aid, v, merged, note, source)
+                self._write_version(db, aid, v, content, note, source, shadow)
+                self._fill_from_existing(db, aid, v)
+                self._rotate_upload(db, aid)
                 sets.update(latest=v, entry=entry)
             cols = ", ".join(f"{k}=?" for k in sets)
             db.execute(f"UPDATE artifacts SET {cols} WHERE id=?", (*sets.values(), aid))
-            # Cards showing this artifact re-render when their finding changes.
-            db.execute(
-                "UPDATE findings SET updated_at=? WHERE kind='artifact' AND (content=? OR content LIKE ?)",
-                (sets["updated_at"], aid, aid + "@%"),
-            )
+            self._touch_cards(db, aid, sets["updated_at"])
         self.changed("artifacts")
         return self.get_artifact(aid)
+
+    def _touch_cards(self, db, aid: str, t: str) -> None:
+        # Cards showing this artifact re-render when their finding changes.
+        db.execute(
+            "UPDATE findings SET updated_at=? WHERE kind='artifact' AND (content=? OR content LIKE ?)", (t, aid, aid + "@%")
+        )
+
+    def receive_upload(self, token: str, digest: str, data: bytes) -> dict[str, Any]:
+        """Fill the latest version's shadow files that have this hash."""
+        digest = digest.lower()
+        with self._tx() as db:
+            row = db.execute("SELECT artifact_id, expires FROM artifact_upload WHERE token=?", (token,)).fetchone()
+            if not row:
+                raise NotFound("this upload link is not valid; a newer publish replaced it, ask for fresh links")
+            if row["expires"] < time.time():
+                raise NotFound("this upload link has expired; ask for fresh links (upload_links)")
+            aid = row["artifact_id"]
+            latest = db.execute("SELECT latest FROM artifacts WHERE id=?", (aid,)).fetchone()["latest"]
+            targets = db.execute(
+                "SELECT path, size FROM artifact_files WHERE artifact_id=? AND version=? AND sha256=? AND pending=1",
+                (aid, latest, digest),
+            ).fetchall()
+            if not targets:
+                raise NotFound("no file waiting for upload has that hash (it may have arrived already)")
+            got = hashlib.sha256(data).hexdigest()
+            if got != digest:
+                raise ValueError(f"content does not match the hash: expected {digest}, got {got}")
+            if len(data) != targets[0]["size"]:
+                raise ValueError(f"expected {targets[0]['size']} bytes, got {len(data)}")
+            db.executemany(
+                "UPDATE artifact_files SET content=?, pending=0 WHERE artifact_id=? AND version=? AND path=?",
+                [(sqlite3.Binary(data), aid, latest, t["path"]) for t in targets],
+            )
+            left = db.execute(
+                "SELECT COUNT(*) FROM artifact_files WHERE artifact_id=? AND version=? AND pending=1", (aid, latest)
+            ).fetchone()[0]
+            t = now()
+            db.execute("UPDATE artifacts SET updated_at=? WHERE id=?", (t, aid))
+            self._touch_cards(db, aid, t)
+        self.changed("artifacts")
+        return {"artifact_id": aid, "version": latest, "stored": [t["path"] for t in targets], "still_waiting": left}
 
     def delete_artifact(self, aid: str) -> dict[str, Any]:
         self.artifact_meta(aid)

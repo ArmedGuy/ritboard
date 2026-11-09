@@ -41,7 +41,7 @@ Tools: `list_workspaces`, `current_workspace`, `create_workspace`, `update_works
 `get_overview`, `list_findings`, `get_finding`, `add_finding`, `add_findings`,
 `update_finding`, `delete_finding`, `create_board`, `update_board`, `delete_board`,
 `get_board`, `place_findings`, `remove_from_board`, `publish_artifact`, `update_artifact`,
-`get_artifact`, `list_artifacts`, `artifact_data`, `delete_artifact`.
+`get_artifact`, `list_artifacts`, `upload_links`, `artifact_data`, `delete_artifact`.
 
 Claude Desktop only starts MCP servers as local commands (stdio). `ritboard mcp` is that
 command: it forwards every call to the running Ritboard over its local HTTP socket, so there
@@ -131,6 +131,20 @@ scripts, styles, data and images. Every publish is a numbered version, kept whol
   `update_artifact` (changed files only; the rest carry over). In the UI, make one with
   ＋ Finding → kind Artifact, edit its `index.html` from the card, and manage them in the
   Artifacts tab, where you can drag one onto the board.
+
+Big files don't have to pass through an MCP call. An agent lists them in `shadow_files`
+with their path, SHA-256 and size. The artifact is published at once, and the reply holds
+one PUT link per waiting file:
+
+```sh
+curl -sS -T data/grid.bin "http://127.0.0.1:5170/w/<ws>/u/<secret>/<sha256>"
+```
+
+Ritboard checks the hash and size, and the file appears in the page as soon as it arrives.
+Until then it answers 404. Files the artifact already has with the same hash are filled
+in without an upload. The secret in the links is replaced on every publish of that
+artifact, so only the latest links work; they also expire after 4 hours. `upload_links`
+lists what's still waiting, and `renew=true` makes fresh links. Up to 64 MB per version.
 
 To bring in a page from elsewhere, an HTML file or a folder with `index.html`:
 
