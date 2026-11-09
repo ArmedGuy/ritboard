@@ -41,6 +41,14 @@ class Hub:
         for ws in dead:
             self.drop(ws)
 
+    async def broadcast_all(self, msg: dict[str, Any]) -> None:
+        text = json.dumps(msg)
+        for ws in list(self.clients):
+            try:
+                await ws.send_text(text)
+            except Exception:
+                self.drop(ws)
+
     def notify(self, workspace: str, what: str) -> None:
         """Called from store code. Safe from the event loop or from a worker thread."""
         loop = self.loop

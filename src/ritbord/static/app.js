@@ -183,7 +183,8 @@ const sock = {
     ws.onopen = () => { this.delay = 500; $('#conn').classList.add('on'); this.subscribe(); scheduleRefresh(); loadWorkspaces(); };
     ws.onmessage = (e) => {
       const m = JSON.parse(e.data);
-      if (m.type === 'workspaces') loadWorkspaces();
+      if (m.type === 'reload') location.reload();
+      else if (m.type === 'workspaces') loadWorkspaces();
       else if (m.workspace === S.ws) scheduleRefresh();
     };
     ws.onclose = () => {

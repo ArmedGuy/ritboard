@@ -33,6 +33,39 @@ class Config:
     port: int = 8765
     token: str | None = None
     allowed_hosts: list[str] = field(default_factory=list)
+    dev: bool = False  # reload open browsers when UI files change
+
+
+async def _watch_static(hub: Hub) -> None:
+    def snapshot() -> dict[str, float]:
+        return {str(p): p.stat().st_mtime for p in STATIC.rglob("*") if p.is_file()}
+
+    last = snapshot()
+    while True:
+        await asyncio.sleep(0.7)
+        try:
+            now = snapshot()
+        except OSError:
+            continue
+        if now != last:
+            last = now
+            await hub.broadcast_all({"type": "reload"})
+
+
+def app_from_env():
+    """Factory for `uvicorn --reload`, which cannot pass arguments."""
+    import os
+
+    return create_app(
+        Config(
+            data_dir=Path(os.environ["RITBORD_DATA"]),
+            host=os.environ.get("RITBORD_HOST", "127.0.0.1"),
+            port=int(os.environ.get("RITBORD_PORT", "8765")),
+            token=os.environ.get("RITBORD_TOKEN") or None,
+            allowed_hosts=[h for h in os.environ.get("RITBORD_ALLOWED_HOSTS", "").split(",") if h],
+            dev=os.environ.get("RITBORD_DEV") == "1",
+        )
+    )
 
 
 # ---- request bodies -------------------------------------------------------
@@ -155,8 +188,11 @@ def create_app(cfg: Config) -> FastAPI:
     @contextlib.asynccontextmanager
     async def lifespan(app: FastAPI):
         hub.loop = asyncio.get_running_loop()
+        watcher = asyncio.create_task(_watch_static(hub)) if cfg.dev else None
         async with mcp.session_manager.run():
             yield
+        if watcher:
+            watcher.cancel()
         reg.close()
 
     app = FastAPI(title="Ritbord", version=__version__, lifespan=lifespan, docs_url="/api/docs", openapi_url="/api/openapi.json")

@@ -51,8 +51,28 @@ def cmd_serve(args) -> None:
 
     if args.host not in ("127.0.0.1", "localhost", "::1") and not args.token:
         print("warning: listening beyond localhost without --token; anyone on the network can edit boards", file=sys.stderr)
-    cfg, app = _build(args)
-    print(f"Ritbord on http://{args.host}:{args.port}  MCP: http://{args.host}:{args.port}/mcp  data: {cfg.data_dir}")
+    print(f"Ritbord on http://{args.host}:{args.port}  MCP: http://{args.host}:{args.port}/mcp  data: {args.data}")
+    if args.dev:
+        # Restart on Python changes; open browsers reload on UI changes.
+        os.environ.update(
+            RITBORD_DATA=str(args.data),
+            RITBORD_HOST=args.host,
+            RITBORD_PORT=str(args.port),
+            RITBORD_TOKEN=args.token or "",
+            RITBORD_ALLOWED_HOSTS=",".join(args.allowed_hosts),
+            RITBORD_DEV="1",
+        )
+        uvicorn.run(
+            "ritbord.server:app_from_env",
+            factory=True,
+            host=args.host,
+            port=args.port,
+            log_level=args.log_level,
+            reload=True,
+            reload_dirs=[str(Path(__file__).parent)],
+        )
+        return
+    _, app = _build(args)
     uvicorn.run(app, host=args.host, port=args.port, log_level=args.log_level)
 
 
@@ -124,6 +144,7 @@ def main(argv: list[str] | None = None) -> None:
     s = sub.add_parser("serve", help="run the server (for a service or a browser)")
     _serve_args(s)
     s.add_argument("--log-level", default="info")
+    s.add_argument("--dev", action="store_true", help="restart on code changes and reload open browsers on UI changes")
     s.set_defaults(func=cmd_serve)
 
     a = sub.add_parser("app", help="open a native window (starts a server unless --url is given)")
