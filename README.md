@@ -90,6 +90,9 @@ Themes (Settings → This screen): dark blue-grey (default), black and light. Th
 cutting-mat grid: fine lines every 20 px, heavier ones every 100 px, and pixel numbers along
 the top and left edges. A board can still have its own background colour.
 
+Settings → This screen also sets the size of the bars and panels (small, medium, large,
+extra large) without changing the board.
+
 With *1 board pixel = 1 device pixel* on (Settings → This screen), OS display scaling is
 cancelled out, so a 3840×2160 board fills a 4K panel exactly at 150% or 200% Windows scaling.
 
@@ -126,7 +129,8 @@ scripts, styles, data and images. Every publish is a numbered version, kept whol
 - Each artifact has its own small database. Pages reach it the same way claude.ai artifacts
   do: `const db = await window.claude.use("db")`, then `db.collection("plan")` with `doc(id)`,
   `set`, `update`, `delete`, `get`, `add` and `onSnapshot`. Ritboard loads a small runtime
-  into every artifact page for this; open pages see changes within about 1.5 seconds.
+  into every artifact page for this. Changes are pushed to open pages as they happen; a
+  page opened full-window also reloads itself when a new version is published.
   Agents read and write the same data with the `artifact_data` tool. Other claude.ai page
   features (calling Claude, user identity, file uploads) don't exist here.
 - Agents use `publish_artifact` (with `html` for one page or `files` for several) and

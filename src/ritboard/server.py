@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import Any
 
 from fastapi import Body, FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
-from fastapi.responses import FileResponse, JSONResponse, RedirectResponse, Response
+from fastapi.responses import FileResponse, JSONResponse, RedirectResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from mcp.server.transport_security import TransportSecuritySettings
 from pydantic import BaseModel
@@ -151,9 +151,10 @@ _HEAD_OPEN = re.compile(rb"<head\b[^>]*>", re.I)
 _DOC_START = re.compile(rb"^\s*(<!doctype[^>]*>)?\s*(<html\b[^>]*>)?", re.I)
 
 
-def inject_runtime(html: bytes, src: str) -> bytes:
-    """Load the Ritboard runtime before any of the page's own scripts."""
-    tag = f'<script src="{src}"></script>'.encode()
+def inject_runtime(html: bytes, src: str, version: int = 0, pinned: bool = False) -> bytes:
+    """Load the Ritboard runtime before any of the page's own scripts. It is told which
+    version it is part of, so it can reload when a newer one is published."""
+    tag = f'<script src="{src}" data-version="{version}"{" data-pinned" if pinned else ""}></script>'.encode()
     m = _HEAD_OPEN.search(html)
     if m:
         return html[: m.end()] + tag + html[m.end():]
@@ -475,6 +476,42 @@ def create_app(cfg: Config) -> FastAPI:
 
         return db_call(run)
 
+    @app.get("/w/{ws}/a/{ref}/_events")
+    async def artifact_events(ws: str, ref: str, request: Request):
+        """Server-sent events for an open artifact page: version, db, deleted."""
+        st = reg.get(ws)
+        aid = parse_artifact_ref(ref)[0]
+        a = st.artifact_meta(aid)
+        q = hub.watch_artifact(st.id, aid)
+
+        async def stream():
+            try:
+                hello = json.dumps({"latest": a["latest"], "rev": st.db_rev(aid)})
+                yield f"event: hello\ndata: {hello}\n\n"
+                while True:
+                    try:
+                        kind = await asyncio.wait_for(q.get(), timeout=20)
+                    except asyncio.TimeoutError:
+                        if await request.is_disconnected():
+                            return
+                        yield ": keepalive\n\n"
+                        continue
+                    try:
+                        latest = st.artifact_meta(aid)["latest"]
+                    except NotFound:
+                        latest = None
+                    yield f"event: {kind}\ndata: {json.dumps({'latest': latest})}\n\n"
+                    if kind == "deleted":
+                        return
+            finally:
+                hub.unwatch_artifact(st.id, aid, q)
+
+        return StreamingResponse(
+            stream(),
+            media_type="text/event-stream",
+            headers={"Access-Control-Allow-Origin": "*", "Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+        )
+
     @app.get("/w/{ws}/a/{ref}/_ritboard.js")
     async def artifact_runtime(ws: str, ref: str):
         return Response(
@@ -482,6 +519,9 @@ def create_app(cfg: Config) -> FastAPI:
             media_type="text/javascript; charset=utf-8",
             headers={"Access-Control-Allow-Origin": "*", "Cache-Control": "no-cache"},
         )
+
+    def st_latest(ws: str, aid: str) -> int:
+        return reg.get(ws).artifact_meta(aid)["latest"]
 
     @app.get("/w/{ws}/a/{ref}/{path:path}")
     async def artifact_file(ws: str, ref: str, path: str):
@@ -491,7 +531,8 @@ def create_app(cfg: Config) -> FastAPI:
         except NotFound as e:
             return Response(str(e), status_code=404, media_type="text/plain", headers={"Content-Security-Policy": ARTIFACT_CSP})
         if ctype.startswith("text/html"):
-            data = inject_runtime(data, f"/w/{ws}/a/{aid}/_ritboard.js")
+            served = version or st_latest(ws, aid)
+            data = inject_runtime(data, f"/w/{ws}/a/{aid}/_ritboard.js", served, pinned=bool(version))
         headers = {
             "Content-Security-Policy": ARTIFACT_CSP,
             "Access-Control-Allow-Origin": "*",  # the sandboxed page fetches its own files from an opaque origin

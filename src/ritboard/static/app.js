@@ -92,7 +92,7 @@ const S = {
   pendingRefresh: false,
   editing: null,         // finding id, or 'new'
   space: false,
-  disp: Object.assign({ device: true, grid: true, snap: true, theme: 'dark' }, LS.get('display', {})),
+  disp: Object.assign({ device: true, grid: true, snap: true, theme: 'dark', ui: 'medium' }, LS.get('display', {})),
 };
 
 const by = {
@@ -248,8 +248,8 @@ function setZoom(z, cx, cy) {
 function openArea() {
   const vp = $('#viewport').getBoundingClientRect();
   const body = document.body.classList;
-  const top = body.contains('chrome-off') ? 0 : $('#topbar').offsetHeight;
-  const left = body.contains('chrome-off') || body.contains('side-off') ? 0 : $('#sidebar').offsetWidth;
+  const top = body.contains('chrome-off') ? 0 : $('#topbar').getBoundingClientRect().height;
+  const left = body.contains('chrome-off') || body.contains('side-off') ? 0 : $('#sidebar').getBoundingClientRect().width;
   return { left, top, width: vp.width - left, height: vp.height - top };
 }
 function fitView() {
@@ -1067,6 +1067,7 @@ async function openSettings() {
   $('#set-cats').replaceChildren(...Object.entries(st.categories).map(([name, color]) =>
     h('label', {}, h('input', { type: 'color', value: color, 'data-cat': name }), name)));
   f.d_theme.value = S.disp.theme;
+  f.d_ui.value = S.disp.ui || 'medium';
   f.d_device.checked = S.disp.device;
   f.d_grid.checked = S.disp.grid;
   f.d_snap.checked = S.disp.snap;
@@ -1109,10 +1110,10 @@ function wireSettings() {
     await loadWorkspaces();
     if (S.workspaces[0]) await selectWorkspace(S.workspaces[0].id);
   };
-  for (const k of ['d_theme', 'd_device', 'd_grid', 'd_snap']) {
+  for (const k of ['d_theme', 'd_ui', 'd_device', 'd_grid', 'd_snap']) {
     f[k].onchange = () => {
       const themeChanged = f.d_theme.value !== S.disp.theme;
-      S.disp = { theme: f.d_theme.value, device: f.d_device.checked, grid: f.d_grid.checked, snap: f.d_snap.checked };
+      S.disp = { theme: f.d_theme.value, ui: f.d_ui.value, device: f.d_device.checked, grid: f.d_grid.checked, snap: f.d_snap.checked };
       LS.set('display', S.disp);
       applyTheme();
       if (themeChanged) for (const c of S.cardEls.values()) delete c.dataset.ver;  // rebuild framed HTML in new colors
@@ -1223,9 +1224,11 @@ function wire() {
 }
 
 const THEMES = ['dark', 'black', 'light'];
+const UI_ZOOM = { small: 0.85, medium: 1, large: 1.25, xlarge: 1.6 };
 function applyTheme() {
   if (!THEMES.includes(S.disp.theme)) S.disp.theme = 'dark';
   document.documentElement.dataset.theme = S.disp.theme;
+  document.documentElement.style.setProperty('--ui-zoom', UI_ZOOM[S.disp.ui] || 1);
 }
 
 async function main() {

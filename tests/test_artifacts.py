@@ -1,4 +1,6 @@
 import asyncio
+import json
+import time
 import base64
 
 import httpx
@@ -109,7 +111,7 @@ def test_artifact_database(server):  # noqa: F811
             ws = data(await c.call_tool("create_workspace", {"name": "Db"}))["workspace"]["id"]
             aid = data(await c.call_tool("publish_artifact", {"workspace": ws, "title": "p", "html": "<head></head><p>x</p>"}))["artifact"]["id"]
             page = httpx.get(f"{server}/w/{ws}/a/{aid}/").text
-            assert f'<script src="/w/{ws}/a/{aid}/_ritboard.js"></script>' in page
+            assert f'<script src="/w/{ws}/a/{aid}/_ritboard.js" data-version="1"></script>' in page
             assert "window.claude" in httpx.get(f"{server}/w/{ws}/a/{aid}/_ritboard.js").text
 
             base = f"{server}/w/{ws}/a/{aid}/_db"
@@ -231,3 +233,41 @@ def test_shadow_files_from_local_paths(tmp_path):
             assert "off on this server" in res["local_files"][0]["error"]
 
     asyncio.run(run())
+
+
+def test_artifact_events_are_pushed(server):  # noqa: F811
+    import threading
+
+    ws = httpx.post(server + "/api/workspaces", json={"name": "Events"}).json()["id"]
+    aid = httpx.post(f"{server}/api/w/{ws}/artifacts", json={"title": "E", "files": {"index.html": "<head></head>v1"}}).json()["artifact"]["id"]
+    page = httpx.get(f"{server}/w/{ws}/a/{aid}/").text
+    assert 'data-version="1"' in page and "data-pinned" not in page
+    assert "data-pinned" in httpx.get(f"{server}/w/{ws}/a/{aid}@1/").text
+
+    events = []
+
+    def listen():
+        with httpx.stream("GET", f"{server}/w/{ws}/a/{aid}/_events", timeout=10) as r:
+            assert r.headers["access-control-allow-origin"] == "*"
+            name = None
+            for line in r.iter_lines():
+                if line.startswith("event: "):
+                    name = line[7:]
+                elif line.startswith("data: ") and name:
+                    events.append((name, line[6:]))
+                    if name == "deleted":
+                        return
+
+    t = threading.Thread(target=listen, daemon=True)
+    t.start()
+    for _ in range(50):
+        if events:
+            break
+        time.sleep(0.05)
+    httpx.put(f"{server}/w/{ws}/a/{aid}/_db/doc", params={"c": "x", "id": "d"}, json={"a": 1})
+    httpx.post(f"{server}/api/w/{ws}/artifacts/{aid}/versions", json={"files": {"index.html": "v2"}})
+    httpx.delete(f"{server}/api/w/{ws}/artifacts/{aid}")
+    t.join(5)
+    names = [n for n, _ in events]
+    assert names[0] == "hello" and "db" in names and "version" in names and names[-1] == "deleted"
+    assert json.loads(dict(events)["version"])["latest"] == 2

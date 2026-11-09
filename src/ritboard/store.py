@@ -277,6 +277,10 @@ class WorkspaceStore:
         with self._lock:
             return self.db.execute(sql, args).fetchall()
 
+    def _art_event(self, aid: str, kind: str) -> None:
+        """Tell open artifact pages: kind is version (files changed), db or deleted."""
+        self._notify(self.id, f"artifact:{kind}:{aid}")
+
     def changed(self, what: str) -> None:
         self._touch()
         self._notify(self.id, what)
@@ -905,6 +909,7 @@ class WorkspaceStore:
             db.execute(f"UPDATE artifacts SET {cols} WHERE id=?", (*sets.values(), aid))
             self._touch_cards(db, aid, sets["updated_at"])
         self.changed("artifacts")
+        self._art_event(aid, "version")
         return self.get_artifact(aid)
 
     def _touch_cards(self, db, aid: str, t: str) -> None:
@@ -923,6 +928,7 @@ class WorkspaceStore:
                 raise NotFound("this upload link has expired; ask for fresh links (upload_links)")
             out = self._fill(db, row["artifact_id"], digest, data)
         self.changed("artifacts")
+        self._art_event(out["artifact_id"], "version")
         return out
 
     def fill_shadow(self, aid: str, digest: str, data: bytes) -> dict[str, Any]:
@@ -931,6 +937,7 @@ class WorkspaceStore:
         with self._tx() as db:
             out = self._fill(db, aid, digest, data)
         self.changed("artifacts")
+        self._art_event(aid, "version")
         return out
 
     def _fill(self, db, aid: str, digest: str, data: bytes) -> dict[str, Any]:
@@ -967,6 +974,7 @@ class WorkspaceStore:
             ).rowcount
             db.execute("DELETE FROM artifacts WHERE id=?", (aid,))
         self.changed("artifacts")
+        self._art_event(aid, "deleted")
         return {"deleted": aid, "cards_removed": n}
 
     # ---- artifact database --------------------------------------------
@@ -1039,6 +1047,7 @@ class WorkspaceStore:
                 (aid, collection, doc_id, text, version, t),
             )
             self._bump(db, aid)
+        self._art_event(aid, "db")
         return {"id": doc_id, "data": new, "version": version, "updatedAt": t}
 
     def db_delete(self, aid: str, collection: str, doc_id: str, if_version: int | None = None) -> None:
@@ -1056,6 +1065,7 @@ class WorkspaceStore:
                 "DELETE FROM artifact_docs WHERE artifact_id=? AND collection=? AND doc_id=?", (aid, collection, doc_id)
             )
             self._bump(db, aid)
+        self._art_event(aid, "db")
 
     # ---- views ----------------------------------------------------------
     def state(self) -> dict[str, Any]:

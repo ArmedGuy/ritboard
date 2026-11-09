@@ -1,14 +1,22 @@
 // Ritboard artifact runtime. Loaded into every artifact page before its own scripts.
 // It gives the page a small per-artifact database with the same shape claude.ai artifacts
 // use: `const db = await window.claude.use("db"); db.collection("plan").onSnapshot(...)`.
-// Data lives in the workspace file, next to the artifact. Changes from other viewers and
-// from agents arrive by polling.
+// Data lives in the workspace file, next to the artifact. Ritboard pushes changes over a
+// server-sent event stream: database writes by other viewers or agents arrive at once, and
+// a page opened on its own reloads when a new version is published. (Inside a board card
+// the board reloads it.) If the stream drops, the database falls back to polling.
 (() => {
   'use strict';
   const m = location.pathname.match(/^(\/w\/[^/]+\/a\/[^/@]+)(?:@\d+)?\//);
   if (!m) return;
   const base = m[1] + '/_db';
-  const POLL_MS = 1500;
+  const me = document.currentScript;
+  const loadedVersion = Number(me && me.dataset.version) || 0;
+  const pinned = !!(me && 'pinned' in me.dataset);
+  let topLevel = true;
+  try { topLevel = window.self === window.top; } catch { topLevel = false; }
+  let live = false;  // event stream connected
+  const pollMs = () => (live ? 15000 : 1500);
 
   async function call(method, path, params, body) {
     const q = new URLSearchParams(params).toString();
@@ -115,7 +123,7 @@
         for (const l of this._listeners) if (l.error) try { l.error(e); } catch { /* listener threw */ }
       } finally {
         this._busy = false;
-        if (this._listeners.size) this._timer = setTimeout(() => this._poll(), POLL_MS);
+        if (this._listeners.size) this._timer = setTimeout(() => this._poll(), pollMs());
       }
     }
     _emit(l, changes) {
@@ -142,6 +150,25 @@
       return this.collection(path.slice(0, i)).doc(path.slice(i + 1));
     },
   };
+
+  // Push from Ritboard.
+  function connect() {
+    if (!window.EventSource) return;
+    const es = new EventSource(m[1] + '/_events');
+    es.addEventListener('hello', (e) => {
+      live = true;
+      const { latest } = JSON.parse(e.data);
+      if (!pinned && topLevel && loadedVersion && latest > loadedVersion) location.reload();
+    });
+    es.addEventListener('db', () => { for (const c of collections.values()) c._kick(); });
+    es.addEventListener('version', (e) => {
+      const { latest } = JSON.parse(e.data);
+      if (!pinned && topLevel && latest && latest !== loadedVersion) location.reload();
+    });
+    es.addEventListener('deleted', () => { es.close(); });
+    es.onerror = () => { live = false; };  // EventSource retries by itself
+  }
+  connect();
 
   const claude = window.claude || {};
   claude.ritboard = true;
