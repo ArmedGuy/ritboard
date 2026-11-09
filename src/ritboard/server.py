@@ -43,6 +43,14 @@ class Config:
     token: str | None = None
     allowed_hosts: list[str] = field(default_factory=list)
     dev: bool = False  # reload open browsers when UI files change
+    # Folders agents may point at with local_path to fill shadow files from this computer.
+    # None: the home folder when listening on localhost only, otherwise off.
+    file_roots: list[Path] | None = None
+
+    def local_file_roots(self) -> list[Path]:
+        if self.file_roots is not None:
+            return [Path(p).expanduser() for p in self.file_roots]
+        return [Path.home()] if self.host in LOCAL_HOSTS else []
 
 
 async def _watch_static(hub: Hub) -> None:
@@ -75,6 +83,16 @@ def _write_beacon(cfg: Config) -> Path:
     return path
 
 
+def _roots_from_env(value: str | None) -> list[Path] | None:
+    import os
+
+    if value is None or value == "":
+        return None
+    if value.lower() == "none":
+        return []
+    return [Path(v) for v in value.split(os.pathsep) if v]
+
+
 def app_from_env():
     """Factory for `uvicorn --reload`, which cannot pass arguments."""
     import os
@@ -87,6 +105,7 @@ def app_from_env():
             token=os.environ.get("RITBOARD_TOKEN") or None,
             allowed_hosts=[h for h in os.environ.get("RITBOARD_ALLOWED_HOSTS", "").split(",") if h],
             dev=os.environ.get("RITBOARD_DEV") == "1",
+            file_roots=_roots_from_env(os.environ.get("RITBOARD_FILE_ROOTS")),
         )
     )
 
@@ -227,7 +246,7 @@ def create_app(cfg: Config) -> FastAPI:
         reg.create("Scratch")
 
     shown_host = "127.0.0.1" if cfg.host in ("0.0.0.0", "", "::") else cfg.host
-    mcp = build_mcp(reg, ui_state, base_url=f"http://{shown_host}:{cfg.port}")
+    mcp = build_mcp(reg, ui_state, base_url=f"http://{shown_host}:{cfg.port}", file_roots=cfg.local_file_roots())
     if cfg.host in LOCAL_HOSTS and not cfg.allowed_hosts:
         security = None  # SDK default: DNS rebinding protection for localhost
     elif cfg.allowed_hosts:

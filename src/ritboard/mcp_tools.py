@@ -4,13 +4,14 @@ from __future__ import annotations
 
 import base64
 import functools
+from pathlib import Path
 from typing import Any
 
 from mcp.server.mcpserver import MCPServer
 from mcp.server.mcpserver.exceptions import ToolError
 from pydantic import BaseModel, Field
 
-from .store import Registry
+from .store import ARTIFACT_MAX_BYTES, Registry
 
 INSTRUCTIONS = """\
 Ritboard is a big-screen planning board. Use it to post findings, sort them, and lay them out.
@@ -38,6 +39,10 @@ Model:
   them in shadow_files (path, sha256, size); the reply gives one PUT link per file. Send each
   with curl -T from your shell. Hashes are checked; files appear as they arrive. Each
   publish replaces the links; upload_links gives them again.
+  If you can't reach the server over HTTP but can write files on the computer it runs on
+  (a sandboxed session with a folder from that computer), save the file there and give its
+  absolute path on that computer as local_path in shadow_files, or call
+  fill_from_local_files later. Ritboard reads it from disk and checks the hash.
 - Never post claude.ai or claude.site links (Claude artifacts) as url cards; they are refused,
   because claude.ai can't be shown inside another page. Publish the artifact's HTML with
   publish_artifact instead: get the HTML (from your own output, or by reading the artifact)
@@ -71,9 +76,19 @@ class PlacementIn(BaseModel):
 
 
 class ShadowFile(BaseModel):
-    path: str = Field(description="Relative path, e.g. data/grid.bin")
+    path: str = Field(description="Relative path in the artifact, e.g. data/grid.bin")
     sha256: str = Field(description="SHA-256 of the file, 64 hex characters")
     size: int = Field(description="Size in bytes")
+    local_path: str | None = Field(
+        None,
+        description="Absolute path of the file on the computer running Ritboard (e.g. C:\\Users\\me\\Projects\\x\\grid.bin). "
+        "Ritboard reads it there; no upload needed.",
+    )
+
+
+class LocalFile(BaseModel):
+    sha256: str = Field(description="SHA-256 of the file, as registered in shadow_files")
+    local_path: str = Field(description="Absolute path of the file on the computer running Ritboard")
 
 
 class ArtifactFile(BaseModel):
@@ -96,7 +111,30 @@ def _decode(files: list[ArtifactFile] | None, html: str | None) -> dict[str, byt
     return out
 
 
-def build_mcp(reg: Registry, ui_state: dict[str, Any], base_url: str = "") -> MCPServer:
+def read_local(path: str, roots: list[Path]) -> bytes:
+    """Read a file on this computer for a shadow file. Only inside the allowed folders; the
+    caller must also know the file's hash, so this can't be used to read unknown files."""
+    if not roots:
+        raise ValueError(
+            "reading local files is off on this server; start Ritboard with --allow-files <folder>, or use the upload links"
+        )
+    p = Path(path).expanduser()
+    if not p.is_absolute():
+        raise ValueError(f"local_path must be absolute on the computer running Ritboard: {path}")
+    p = p.resolve()
+    if not any(p.is_relative_to(r.resolve()) for r in roots):
+        raise ValueError(f"{p} is outside the folders Ritboard may read ({', '.join(str(r) for r in roots)})")
+    if not p.is_file():
+        raise ValueError(f"no such file on the computer running Ritboard: {p}")
+    if p.stat().st_size > ARTIFACT_MAX_BYTES:
+        raise ValueError(f"{p} is larger than {ARTIFACT_MAX_BYTES} bytes")
+    return p.read_bytes()
+
+
+def build_mcp(
+    reg: Registry, ui_state: dict[str, Any], base_url: str = "", file_roots: list[Path] | None = None
+) -> MCPServer:
+    roots = list(file_roots or [])
     mcp = MCPServer("ritboard", title="Ritboard", instructions=INSTRUCTIONS)
 
     def tool(fn):
@@ -122,6 +160,17 @@ def build_mcp(reg: Registry, ui_state: dict[str, Any], base_url: str = "") -> MC
         if links and a.get("pending"):
             a["uploads"] = upload_out(ws, reg.get(ws).upload_links(a["id"]))
         return a
+
+    def fill_locals(st, aid: str, items: list[tuple[str, str]]) -> list[dict[str, Any]]:
+        """Fill shadow files from local paths: (sha256, local_path) pairs. Errors are reported per file."""
+        done = []
+        for digest, local in items:
+            try:
+                r = st.fill_shadow(aid, digest, read_local(local, roots))
+                done.append({"local_path": local, "stored": r["stored"]})
+            except (ValueError, LookupError, OSError) as e:
+                done.append({"local_path": local, "error": str(e)})
+        return done
 
     def upload_out(ws: str, links: dict[str, Any]) -> dict[str, Any]:
         files, seen = [], set()
@@ -393,7 +442,12 @@ def build_mcp(reg: Registry, ui_state: dict[str, Any], base_url: str = "") -> MC
         st = reg.get(workspace)
         shadows = {s.path: s.model_dump() for s in shadow_files or []}
         a = st.create_artifact(title, _decode(files, html), entry, description, source, shadows=shadows)
+        local = fill_locals(st, a["id"], [(s.sha256, s.local_path) for s in shadow_files or [] if s.local_path])
+        if local:
+            a = st.get_artifact(a["id"])
         out: dict[str, Any] = {"artifact": art_out(st.id, a)}
+        if local:
+            out["local_files"] = local
         if add_card:
             f = st.add_finding(title, a["id"], "artifact", parent_id, category, tags, source)
             out["finding_id"] = f["id"]
@@ -425,7 +479,13 @@ def build_mcp(reg: Registry, ui_state: dict[str, Any], base_url: str = "") -> MC
         a = st.update_artifact(
             artifact_id, _decode(files, html), remove, note, title, description, entry, source, shadows=shadows
         )
-        return art_out(st.id, a)
+        local = fill_locals(st, artifact_id, [(s.sha256, s.local_path) for s in shadow_files or [] if s.local_path])
+        if local:
+            a = st.get_artifact(artifact_id)
+        out = art_out(st.id, a)
+        if local:
+            out["local_files"] = local
+        return out
 
     @tool
     async def get_artifact(
@@ -442,6 +502,15 @@ def build_mcp(reg: Registry, ui_state: dict[str, Any], base_url: str = "") -> MC
         """All artifacts in a workspace: id, title, latest version, file count, size, address."""
         st = reg.get(workspace)
         return {"artifacts": [art_out(st.id, a, links=False) for a in st.list_artifacts()]}
+
+    @tool
+    async def fill_from_local_files(workspace: str, artifact_id: str, files: list[LocalFile]) -> dict[str, Any]:
+        """Fill waiting shadow files from files on the computer running Ritboard, for agents
+        that share the computer but can't reach the server over HTTP (sandboxed sessions that
+        can write to a folder on it). Give each file's sha256 and its absolute path there."""
+        st = reg.get(workspace)
+        done = fill_locals(st, artifact_id, [(f.sha256, f.local_path) for f in files])
+        return {"local_files": done, "artifact": art_out(st.id, st.get_artifact(artifact_id))}
 
     @tool
     async def upload_links(workspace: str, artifact_id: str, renew: bool = False) -> dict[str, Any]:

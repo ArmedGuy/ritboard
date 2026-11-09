@@ -914,38 +914,49 @@ class WorkspaceStore:
         )
 
     def receive_upload(self, token: str, digest: str, data: bytes) -> dict[str, Any]:
-        """Fill the latest version's shadow files that have this hash."""
-        digest = digest.lower()
+        """Fill the latest version's shadow files that have this hash, via an upload link."""
         with self._tx() as db:
             row = db.execute("SELECT artifact_id, expires FROM artifact_upload WHERE token=?", (token,)).fetchone()
             if not row:
                 raise NotFound("this upload link is not valid; a newer publish replaced it, ask for fresh links")
             if row["expires"] < time.time():
                 raise NotFound("this upload link has expired; ask for fresh links (upload_links)")
-            aid = row["artifact_id"]
-            latest = db.execute("SELECT latest FROM artifacts WHERE id=?", (aid,)).fetchone()["latest"]
-            targets = db.execute(
-                "SELECT path, size FROM artifact_files WHERE artifact_id=? AND version=? AND sha256=? AND pending=1",
-                (aid, latest, digest),
-            ).fetchall()
-            if not targets:
-                raise NotFound("no file waiting for upload has that hash (it may have arrived already)")
-            got = hashlib.sha256(data).hexdigest()
-            if got != digest:
-                raise ValueError(f"content does not match the hash: expected {digest}, got {got}")
-            if len(data) != targets[0]["size"]:
-                raise ValueError(f"expected {targets[0]['size']} bytes, got {len(data)}")
-            db.executemany(
-                "UPDATE artifact_files SET content=?, pending=0 WHERE artifact_id=? AND version=? AND path=?",
-                [(sqlite3.Binary(data), aid, latest, t["path"]) for t in targets],
-            )
-            left = db.execute(
-                "SELECT COUNT(*) FROM artifact_files WHERE artifact_id=? AND version=? AND pending=1", (aid, latest)
-            ).fetchone()[0]
-            t = now()
-            db.execute("UPDATE artifacts SET updated_at=? WHERE id=?", (t, aid))
-            self._touch_cards(db, aid, t)
+            out = self._fill(db, row["artifact_id"], digest, data)
         self.changed("artifacts")
+        return out
+
+    def fill_shadow(self, aid: str, digest: str, data: bytes) -> dict[str, Any]:
+        """Fill shadow files directly, e.g. from a file on this computer."""
+        self.artifact_meta(aid)
+        with self._tx() as db:
+            out = self._fill(db, aid, digest, data)
+        self.changed("artifacts")
+        return out
+
+    def _fill(self, db, aid: str, digest: str, data: bytes) -> dict[str, Any]:
+        digest = digest.lower()
+        latest = db.execute("SELECT latest FROM artifacts WHERE id=?", (aid,)).fetchone()["latest"]
+        targets = db.execute(
+            "SELECT path, size FROM artifact_files WHERE artifact_id=? AND version=? AND sha256=? AND pending=1",
+            (aid, latest, digest),
+        ).fetchall()
+        if not targets:
+            raise NotFound("no file waiting for upload has that hash (it may have arrived already)")
+        got = hashlib.sha256(data).hexdigest()
+        if got != digest:
+            raise ValueError(f"content does not match the hash: expected {digest}, got {got}")
+        if len(data) != targets[0]["size"]:
+            raise ValueError(f"expected {targets[0]['size']} bytes, got {len(data)}")
+        db.executemany(
+            "UPDATE artifact_files SET content=?, pending=0 WHERE artifact_id=? AND version=? AND path=?",
+            [(sqlite3.Binary(data), aid, latest, t["path"]) for t in targets],
+        )
+        left = db.execute(
+            "SELECT COUNT(*) FROM artifact_files WHERE artifact_id=? AND version=? AND pending=1", (aid, latest)
+        ).fetchone()[0]
+        t = now()
+        db.execute("UPDATE artifacts SET updated_at=? WHERE id=?", (t, aid))
+        self._touch_cards(db, aid, t)
         return {"artifact_id": aid, "version": latest, "stored": [t["path"] for t in targets], "still_waiting": left}
 
     def delete_artifact(self, aid: str) -> dict[str, Any]:

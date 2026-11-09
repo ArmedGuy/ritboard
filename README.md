@@ -41,7 +41,7 @@ Tools: `list_workspaces`, `current_workspace`, `create_workspace`, `update_works
 `get_overview`, `list_findings`, `get_finding`, `add_finding`, `add_findings`,
 `update_finding`, `delete_finding`, `create_board`, `update_board`, `delete_board`,
 `get_board`, `place_findings`, `remove_from_board`, `publish_artifact`, `update_artifact`,
-`get_artifact`, `list_artifacts`, `upload_links`, `artifact_data`, `delete_artifact`.
+`get_artifact`, `list_artifacts`, `upload_links`, `fill_from_local_files`, `artifact_data`, `delete_artifact`.
 
 Claude Desktop only starts MCP servers as local commands (stdio). `ritboard mcp` is that
 command: it forwards every call to the running Ritboard over its local HTTP socket, so there
@@ -145,6 +145,14 @@ Until then it answers 404. Files the artifact already has with the same hash are
 in without an upload. The secret in the links is replaced on every publish of that
 artifact, so only the latest links work; they also expire after 4 hours. `upload_links`
 lists what's still waiting, and `renew=true` makes fresh links. Up to 64 MB per version.
+
+Agents on the same computer that can't reach the server over HTTP, such as sandboxed
+sessions that can only write to a folder, save the file there and pass its absolute path on
+this computer as `local_path` in `shadow_files`, or later with `fill_from_local_files`.
+Ritboard reads it from disk and checks the hash, so only files whose content the agent
+already knows can be read. Allowed folders: your home folder by default when listening on
+localhost only, otherwise none; set them with `--allow-files <folder>` (repeatable), or
+turn it off with `--no-local-files`.
 
 To bring in a page from elsewhere, an HTML file or a folder with `index.html`:
 

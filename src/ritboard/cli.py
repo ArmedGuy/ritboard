@@ -47,6 +47,16 @@ def _serve_args(p: argparse.ArgumentParser, default_host: str = "127.0.0.1", def
         help="require this token for the API, MCP and UI (use when listening beyond localhost)",
     )
     p.add_argument(
+        "--allow-files",
+        action="append",
+        type=Path,
+        dest="file_roots",
+        default=None,
+        help="folder agents may fill artifact files from with local_path (repeatable; "
+        "default: your home folder when listening on localhost only)",
+    )
+    p.add_argument("--no-local-files", action="store_true", help="don't let agents fill artifact files from local paths")
+    p.add_argument(
         "--allowed-host",
         action="append",
         default=[],
@@ -55,11 +65,18 @@ def _serve_args(p: argparse.ArgumentParser, default_host: str = "127.0.0.1", def
     )
 
 
+def _file_roots(args) -> list[Path] | None:
+    if args.no_local_files:
+        return []
+    return args.file_roots  # None means the default
+
+
 def _build(args):
     from .server import Config, create_app
 
     cfg = Config(
-        data_dir=args.data, host=args.host, port=args.port, token=args.token, allowed_hosts=args.allowed_hosts
+        data_dir=args.data, host=args.host, port=args.port, token=args.token, allowed_hosts=args.allowed_hosts,
+        file_roots=_file_roots(args),
     )
     return cfg, create_app(cfg)
 
@@ -100,6 +117,7 @@ def cmd_serve(args) -> None:
             RITBOARD_TOKEN=args.token or "",
             RITBOARD_ALLOWED_HOSTS=",".join(args.allowed_hosts),
             RITBOARD_DEV="1",
+            RITBOARD_FILE_ROOTS="none" if args.no_local_files else os.pathsep.join(str(p) for p in args.file_roots or []),
         )
         uvicorn.run(
             "ritboard.server:app_from_env",

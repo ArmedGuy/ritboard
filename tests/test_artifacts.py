@@ -182,3 +182,52 @@ def test_shadow_files_and_upload_links(server):  # noqa: F811
             assert renewed["waiting"] == []
 
     asyncio.run(run())
+
+
+def test_shadow_files_from_local_paths(tmp_path):
+    import hashlib
+
+    from ritboard.mcp_tools import build_mcp
+    from ritboard.store import Registry
+
+    allowed = tmp_path / "shared"
+    allowed.mkdir()
+    big = b"\x00\x01" * 100000
+    h = hashlib.sha256(big).hexdigest()
+    (allowed / "grid.bin").write_bytes(big)
+    (tmp_path / "secret.txt").write_text("nope")
+    reg = Registry(tmp_path / "data")
+
+    async def run():
+        async with Client(build_mcp(reg, {}, file_roots=[allowed])) as c:
+            ws = data(await c.call_tool("create_workspace", {"name": "Local"}))["workspace"]["id"]
+            out = data(await c.call_tool("publish_artifact", {
+                "workspace": ws, "title": "Grid", "html": "<p>x</p>",
+                "shadow_files": [{"path": "grid.bin", "sha256": h, "size": len(big), "local_path": str(allowed / "grid.bin")}],
+            }))
+            assert out["local_files"][0]["stored"] == ["grid.bin"] and out["artifact"]["pending"] == 0
+            aid = out["artifact"]["id"]
+            assert reg.get(ws).artifact_file(aid, None, "grid.bin")[0] == big
+
+            # Later fill, and the guards: outside the allowed folder, wrong hash, relative path.
+            sh = hashlib.sha256(b"nope").hexdigest()
+            v2 = data(await c.call_tool("update_artifact", {
+                "workspace": ws, "artifact_id": aid,
+                "shadow_files": [{"path": "s.txt", "sha256": sh, "size": 4}],
+            }))
+            assert v2["pending"] == 1
+            res = data(await c.call_tool("fill_from_local_files", {"workspace": ws, "artifact_id": aid, "files": [
+                {"sha256": sh, "local_path": str(tmp_path / "secret.txt")},
+                {"sha256": sh, "local_path": "relative/secret.txt"},
+                {"sha256": sh, "local_path": str(allowed / "grid.bin")},
+            ]}))
+            errs = [f.get("error", "") for f in res["local_files"]]
+            assert "outside the folders" in errs[0] and "absolute" in errs[1] and "does not match" in errs[2]
+            assert res["artifact"]["pending"] == 1
+
+        async with Client(build_mcp(reg, {}, file_roots=[])) as c:
+            res = data(await c.call_tool("fill_from_local_files", {"workspace": ws, "artifact_id": aid, "files": [
+                {"sha256": sh, "local_path": str(allowed / "grid.bin")}]}))
+            assert "off on this server" in res["local_files"][0]["error"]
+
+    asyncio.run(run())
