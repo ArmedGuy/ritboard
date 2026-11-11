@@ -93,6 +93,11 @@ def _build(args):
     return cfg, create_app(cfg)
 
 
+# Open artifact pages keep a live-update stream open for as long as they are open. Without a
+# limit, a restart (or a --dev reload) waits for them forever.
+SHUTDOWN_GRACE_S = 2
+
+
 def _check_port(host: str, port: int) -> None:
     """Fail early with a readable message instead of a bare socket error."""
     fam = socket.AF_INET6 if ":" in host else socket.AF_INET
@@ -143,10 +148,11 @@ def cmd_serve(args) -> None:
             log_level=args.log_level,
             reload=True,
             reload_dirs=[str(Path(__file__).parent)],
+            timeout_graceful_shutdown=SHUTDOWN_GRACE_S,
         )
         return
     _, app = _build(args)
-    uvicorn.run(app, host=args.host, port=args.port, log_level=args.log_level)
+    uvicorn.run(app, host=args.host, port=args.port, log_level=args.log_level, timeout_graceful_shutdown=SHUTDOWN_GRACE_S)
 
 
 def _free_port(host: str) -> int:
@@ -191,7 +197,8 @@ def cmd_app(args) -> None:
         if args.port == 0:
             args.port = _free_port(args.host)
         _, app = _build(args)
-        server = uvicorn.Server(uvicorn.Config(app, host=args.host, port=args.port, log_level="warning"))
+        server = uvicorn.Server(uvicorn.Config(
+            app, host=args.host, port=args.port, log_level="warning", timeout_graceful_shutdown=SHUTDOWN_GRACE_S))
         threading.Thread(target=server.run, daemon=True).start()
         url = f"http://{args.host}:{args.port}"
         print(f"Ritboard on {url}  MCP: {url}/mcp")
