@@ -1132,14 +1132,24 @@ class WorkspaceStore:
     def art_url(self, aid: str) -> str:
         return f"/w/{urllib.parse.quote(self.id)}/a/{self.art_key(aid)}/"
 
+    def _matches_key(self, e: Entry, key: str) -> bool:
+        if e.kind != "artifact":
+            return False
+        if hmac.compare_digest(self.art_key(e.path), key):
+            return True
+        # Artifacts converted from the SQLite version still answer to their old id, so links
+        # and pages that use the old address (../a_xxxx/) keep working.
+        legacy = str(e.meta.get("legacy_id") or "")
+        return bool(legacy) and hmac.compare_digest(legacy, key)
+
     def artifact_by_key(self, key: str) -> str:
         self._fresh()
         for e in self._entries.values():
-            if e.kind == "artifact" and hmac.compare_digest(self.art_key(e.path), key):
+            if self._matches_key(e, key):
                 return e.path
         self._fresh(force=True)
         for e in self._entries.values():
-            if e.kind == "artifact" and hmac.compare_digest(self.art_key(e.path), key):
+            if self._matches_key(e, key):
                 return e.path
         raise NotFound("no such artifact (it may have been renamed or deleted)")
 

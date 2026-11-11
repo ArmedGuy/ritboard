@@ -84,6 +84,7 @@ def test_sqlite_workspace_becomes_a_folder(tmp_path):
     assert (st.root / "Research" / "Sun map card" / "index.html").read_text() == "<p>new</p>"
     assert (st.root / "Research" / "Sun map card" / "index@v1.html").read_text() == "old"  # history kept
     assert st.get_artifact("Research/Sun map card")["version"] == 2
+    assert st.artifact_by_key("a_1") == "Research/Sun map card"  # the old address still works
     assert st.artifact_file("Research/Sun map card", "index.html", 1)[0] == b"old"
     assert st.db_get("Research/Sun map card", "beds", "b1") == {
         "id": "b1", "data": {"label": "Kale"}, "version": 3, "updatedAt": T,
@@ -99,3 +100,21 @@ def test_sqlite_workspace_becomes_a_folder(tmp_path):
         "Research/Sun map card@v1": (500, 20, 800, 600),  # it was pinned to version 1, and still is
         "Dot.png": (0, 0, 50, 50),
     }
+
+
+def test_old_ids_are_found_for_earlier_conversions(tmp_path):
+    from ritboard.migrate import link_legacy_ids
+
+    data = tmp_path / "data"
+    (data / "workspaces").mkdir(parents=True)
+    _old_workspace(data / "workspaces" / "yard-plan.sqlite")
+    reg = Registry(data, default_root=tmp_path / "ws")
+    migrate_sqlite(reg)
+    st = reg.get("Yard plan")
+    meta = st._meta_yaml()
+    meta["Research/Sun map card"].pop("legacy_id")  # as converted before old ids were kept
+    st._save_meta_yaml(meta)
+    st.mark_dirty()
+    assert link_legacy_ids(reg)
+    assert reg.get("Yard plan").artifact_by_key("a_1") == "Research/Sun map card"
+    assert link_legacy_ids(reg) == []  # once

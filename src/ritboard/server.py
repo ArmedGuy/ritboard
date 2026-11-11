@@ -291,9 +291,9 @@ def create_app(cfg: Config) -> FastAPI:
     ui_state: dict[str, Any] = {"workspace": None, "board": None}
     roots = cfg.local_file_roots()
 
-    from .migrate import migrate_sqlite
+    from .migrate import link_legacy_ids, migrate_sqlite
 
-    for line in migrate_sqlite(reg):
+    for line in migrate_sqlite(reg) + link_legacy_ids(reg):
         print(line)
     if not reg.ids():
         reg.create("Scratch")
@@ -627,7 +627,9 @@ def create_app(cfg: Config) -> FastAPI:
 
     @app.get("/w/{ws}/a/{key}/{path:path}")
     async def artifact_file(ws: str, key: str, path: str):
-        csp = {"Content-Security-Policy": ARTIFACT_CSP}
+        # The page's origin is opaque, so even a 404 needs this header, or the page's fetch
+        # fails with a bare NetworkError instead of seeing the 404.
+        csp = {"Content-Security-Policy": ARTIFACT_CSP, "Access-Control-Allow-Origin": "*"}
         try:
             st, aid = art(ws, key)
             version = art_version(key)
@@ -638,7 +640,6 @@ def create_app(cfg: Config) -> FastAPI:
             data = inject_runtime(data, f"/w/{ws}/a/{key.split('@', 1)[0]}/_ritboard.js", st.stamp(aid), pinned=version is not None)
         headers = {
             **csp,
-            "Access-Control-Allow-Origin": "*",  # the sandboxed page fetches its own files from an opaque origin
             "X-Content-Type-Options": "nosniff",
             "Cache-Control": "no-cache",
         }

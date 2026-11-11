@@ -6,6 +6,7 @@ file moves to <data>/old-sqlite/ so nothing is lost and it isn't converted twice
 
 from __future__ import annotations
 
+import hashlib
 import json
 import shutil
 import sqlite3
@@ -13,7 +14,7 @@ from pathlib import Path
 from typing import Any
 
 from . import files as F
-from .store import Registry, WorkspaceStore, copy_name
+from .store import NotFound, Registry, WorkspaceStore, copy_name, old_copy
 
 
 def _rows(db: sqlite3.Connection, sql: str, args: tuple = ()) -> list[sqlite3.Row]:
@@ -88,6 +89,9 @@ def _convert(db: sqlite3.Connection, st: WorkspaceStore, log: list[str]) -> None
             }
         for coll, d in docs.items():
             st._save_coll(a["id"], coll, d)
+        meta = st._meta_yaml()
+        meta.setdefault(a["id"], {})["legacy_id"] = aid  # old links (/a/<old id>/) keep working
+        st._save_meta_yaml(meta)
         if arts[aid]["latest"] > 1:
             keep_history(aid, a["id"])
         art_paths[aid] = a["id"]
@@ -185,4 +189,45 @@ def migrate_sqlite(reg: Registry) -> list[str]:
                 shutil.move(str(p), str(dest / p.name))
     if log:
         log.append(f"The old files are in {reg.data_dir / 'old-sqlite'}.")
+    return log
+
+
+def link_legacy_ids(reg: Registry) -> list[str]:
+    """For workspaces converted before old artifact ids were kept: find each old artifact's
+    folder by its page content and record the old id, so old addresses work again."""
+    old = reg.data_dir / "old-sqlite"
+    log: list[str] = []
+    for src in sorted(old.glob("*.sqlite")) if old.is_dir() else []:
+        db = sqlite3.connect(f"file:{src}?mode=ro", uri=True)
+        db.row_factory = sqlite3.Row
+        try:
+            name = (_rows(db, "SELECT value FROM meta WHERE key='name'") or [{"value": src.stem}])[0]["value"]
+            try:
+                st = reg.get(name)
+            except NotFound:
+                continue
+            meta = st._meta_yaml()
+            known = {str(v.get("legacy_id")) for v in meta.values() if v.get("legacy_id")}
+            pages: dict[str, str] = {}  # sha of any version of an index.html -> artifact folder
+            for a in st.list_artifacts():
+                for rel, p, _ in st._art_all(a["id"]):
+                    if rel == "index.html" or (old_copy(rel) or ("",))[0] == "index.html":
+                        pages.setdefault(hashlib.sha256(p.read_bytes()).hexdigest(), a["id"])
+            changed = False
+            for r in _rows(db, "SELECT id, title FROM artifacts"):
+                if r["id"] in known:
+                    continue
+                for f in _rows(db, "SELECT content FROM artifact_files WHERE artifact_id=? AND path='index.html' "
+                                   "ORDER BY version DESC", (r["id"],)):
+                    folder = pages.get(hashlib.sha256(bytes(f["content"])).hexdigest())
+                    if folder and not meta.get(folder, {}).get("legacy_id"):
+                        meta.setdefault(folder, {})["legacy_id"] = r["id"]
+                        log.append(f"{st.name}: {folder} also answers to its old address ({r['id']})")
+                        changed = True
+                        break
+            if changed:
+                st._save_meta_yaml(meta)
+                st.mark_dirty()
+        finally:
+            db.close()
     return log
