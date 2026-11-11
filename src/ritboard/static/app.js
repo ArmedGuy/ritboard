@@ -128,7 +128,16 @@ function index() {
     if (p.missing) by.missing.set(p.finding_id, { id: p.finding_id, title: p.finding_id, kind: 'missing', tags: [], updated_at: '' });
   }
 }
-function findingOrGhost(id) { return by.finding.get(id) || by.missing.get(id); }
+function findingOrGhost(id) { return by.finding.get(id) || pinnedCard(id) || by.missing.get(id); }
+
+// A card placed as "Report@v3" shows version 3 of that artifact.
+function pinBase(id) { const m = /^(.+)@v(\d+)$/.exec(id || ''); return m && by.finding.get(m[1])?.kind === 'artifact' ? m : null; }
+function pinnedCard(id) {
+  const m = pinBase(id);
+  if (!m) return null;
+  const base = by.finding.get(m[1]);
+  return { ...base, id, base: base.id, pinned: +m[2], url: base.url.replace(/\/$/, `@v${m[2]}/`) };
+}
 
 let lastProblems = '';
 function showProblems() {
@@ -383,7 +392,8 @@ function makeCard(fid) {
 
 function fmtCount(n, word) { return `${n} ${word}${n === 1 ? '' : 's'}`; }
 function artifactLabel(f) {
-  const label = `artifact · ${fmtCount(f.files || 0, 'file')}`;
+  if (f.pinned) return `v${f.pinned} of ${f.version} · pinned`;
+  const label = `artifact v${f.version || 1} · ${fmtCount(f.files || 0, 'file')}`;
   return f.pending ? `${label} · ${f.pending} on the way` : label;
 }
 
@@ -416,7 +426,7 @@ function updateCard(card, f, g) {
   card.title = [f.category && `Category: ${f.category}`, f.tags?.length && `Tags: ${f.tags.join(', ')}`].filter(Boolean).join('\n');
   const ver = f.kind === 'folder'
     ? f.updated_at + '|' + (by.children.get(f.id) || []).map((c) => c.id + c.title).join(',')
-    : f.updated_at + f.kind + (f.kind === 'artifact' ? '|' + f.stamp : '') + (f.src ? '|' + f.src : '');
+    : f.updated_at + f.kind + (f.kind === 'artifact' ? '|' + (f.pinned ? 'pin' + f.pinned + f.url : f.stamp) : '') + (f.src ? '|' + f.src : '');
   if (card.dataset.ver !== ver) {
     card.dataset.ver = ver;
     fillBody($('.card-body', card), f);
@@ -483,7 +493,7 @@ function updateFrames() {
     const vp = $('#viewport').getBoundingClientRect();
     const v0 = toBoard(vp.left, vp.top), v1 = toBoard(vp.right, vp.bottom);
     for (const [fid, card] of S.cardEls) {
-      const f = by.finding.get(fid);
+      const f = findingOrGhost(fid);
       if (!f || (f.kind !== 'html' && f.kind !== 'url' && f.kind !== 'artifact')) continue;
       const g = S.geom.get(fid);
       if (!g) continue;
@@ -890,7 +900,7 @@ function renderArtifactsTab(body, q) {
     const onBoard = S.geom.has(a.id);
     body.append(h('div', {
       class: 'node art', draggable: 'true',
-      title: `${a.title}\n${a.id}/\n${fmtCount(a.files, 'file')} · ${fmtBytes(a.bytes)} · updated ${new Date(a.updated_at).toLocaleString()}\nDrag onto the board to show it.`,
+      title: `${a.title}\n${a.id}/\nversion ${a.version} · ${fmtCount(a.files, 'file')} · ${fmtBytes(a.bytes)} · updated ${new Date(a.updated_at).toLocaleString()}\nDrag onto the board to show it.`,
       ondragstart: (e) => {
         e.dataTransfer.setData('application/x-ritboard-finding', a.id);
         e.dataTransfer.setData('text/plain', a.title);
@@ -900,7 +910,7 @@ function renderArtifactsTab(body, q) {
     },
     h('span', { class: 'ki' }, 'APP'),
     h('span', { class: 'tt' }, a.title),
-    h('span', { class: 'xy' }, fmtCount(a.files, 'file')),
+    h('span', { class: 'xy' }, `v${a.version}`),
     onBoard ? h('span', { class: 'ob', title: 'On this board' }, '✓') : h('span', { class: 'ob' }),
     h('a', { class: 'mini-link', href: a.url, target: '_blank', rel: 'noopener', title: 'Open in a new window', onclick: (e) => e.stopPropagation() }, '↗'),
     h('button', {
@@ -929,6 +939,7 @@ const HINTS = {
 };
 
 function openEditor(id, parentId) {
+  if (id !== 'new' && !by.finding.has(id) && pinBase(id)) id = pinBase(id)[1];  // a pinned card edits its artifact
   S.editing = id;
   const f = id === 'new' ? null : by.finding.get(id);
   if (id !== 'new' && !f) return;
@@ -971,9 +982,17 @@ async function loadArtifactIntoEditor(f) {
     form.dataset.orig = form.content.value;
     const others = a.files.map((x) => x.path).filter((p) => p !== 'index.html');
     $('#ed-art').replaceChildren(...[
-      h('span', {}, `Editing index.html in ${f.id}/.`),
+      h('span', {}, `Editing index.html of version ${a.version}. Saving makes version ${a.version + 1}; the old file stays as index@v${a.version}.html.`),
       others.length ? h('span', {}, ` Other files: ${others.join(', ')}.`) : null,
       ' ', h('a', { href: f.url, target: '_blank', rel: 'noopener' }, 'Open ↗'),
+      a.version > 1 && board() ? h('button', {
+        type: 'button', class: 'mini', title: 'Place a card that keeps showing an older version',
+        onclick: async () => {
+          const n = parseInt(prompt(`Which version to show on this board? (1 to ${a.version - 1})`, String(a.version - 1)), 10);
+          if (!(n >= 1 && n < a.version)) return;
+          await api.put(`${W()}/boards/${encodeURIComponent(S.boardId)}/placements`, [{ finding_id: `${f.id}@v${n}` }]);
+        },
+      }, 'Place an older version…') : null,
     ].filter(Boolean));
   } catch {
     form.content.value = '';

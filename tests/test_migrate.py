@@ -82,6 +82,9 @@ def test_sqlite_workspace_becomes_a_folder(tmp_path):
     assert "Research/Sun hours/Under a note.txt" in ids
     assert ids["Research/Sun map card"]["kind"] == "artifact"
     assert (st.root / "Research" / "Sun map card" / "index.html").read_text() == "<p>new</p>"
+    assert (st.root / "Research" / "Sun map card" / "index@v1.html").read_text() == "old"  # history kept
+    assert st.get_artifact("Research/Sun map card")["version"] == 2
+    assert st.artifact_file("Research/Sun map card", "index.html", 1)[0] == b"old"
     assert st.db_get("Research/Sun map card", "beds", "b1") == {
         "id": "b1", "data": {"label": "Kale"}, "version": 3, "updatedAt": T,
     }
@@ -93,6 +96,6 @@ def test_sqlite_workspace_becomes_a_folder(tmp_path):
     got = {p["finding_id"]: (p["x"], p["y"], p["w"], p["h"]) for p in b["placements"]}
     assert got == {
         "Research/Sun hours/Sun hours.md": (10, 20, 400, 300),
-        "Research/Sun map card": (500, 20, 800, 600),
+        "Research/Sun map card@v1": (500, 20, 800, 600),  # it was pinned to version 1, and still is
         "Dot.png": (0, 0, 50, 50),
     }

@@ -32,10 +32,14 @@ Model:
   board by themselves while Ritboard runs. Use these tools for placing cards on boards.
 - An artifact is a folder with index.html plus any scripts, styles, data or images: a small
   website with its own address. Use publish_artifact for any page, app, chart or report worth
-  revising; update_artifact changes its files and every card showing it reloads. Relative links
-  between its files work. Pages run sandboxed: no access to Ritboard's API, no cookies or
-  localStorage; libraries from CDNs load normally. There is no version history inside
-  Ritboard; the workspace's git history is the history.
+  revising; update_artifact makes a new version and every card showing it reloads. Relative
+  links between its files work. Pages run sandboxed: no access to Ritboard's API, no cookies
+  or localStorage; libraries from CDNs load normally.
+  Versions: before a file is replaced or removed, Ritboard keeps it next to the new one as
+  name@v<old version>.ext (index@v3.html), so every version stays readable: get_artifact
+  with version=3, or a card that shows version 3 by placing "<artifact id>@v3" with
+  place_findings. Don't name your own files like that. Editing an artifact's files directly
+  on disk changes the current version without making a new one.
   Each artifact has its own small database (JSON files in its .data folder), reached from the
   page the same way as in claude.ai artifacts: `const db = await window.claude.use("db");` then
   `db.collection("plan").doc(id).set({...})`, `.update()`, `.delete()`, `.get()`,
@@ -73,7 +77,9 @@ class FindingIn(BaseModel):
 
 
 class PlacementIn(BaseModel):
-    finding_id: str = Field(description="The finding's path, e.g. Notes/idea.md")
+    finding_id: str = Field(
+        description="The finding's path, e.g. Notes/idea.md. For an artifact, 'Report@v3' shows version 3 instead of the current one."
+    )
     x: int | None = Field(None, description="Left edge in board pixels. Omit with y to auto-place.")
     y: int | None = Field(None, description="Top edge in board pixels.")
     w: int | None = Field(None, description="Width in pixels. Default depends on kind.")
@@ -166,6 +172,8 @@ def build_mcp(
             a["note"] = "Ritboard's server isn't running, so the page has no address right now; start `ritboard serve`."
         else:
             a["url"] = base_url + a["url"]
+            if a.get("latest") and a.get("version") and a["version"] != a["latest"]:
+                a["version_url"] = a["url"].rstrip("/") + f"@v{a['version']}/"
         if links and a.get("pending"):
             a["uploads"] = upload_out(st.id, st.upload_links(a["id"]))
         return a
@@ -490,9 +498,10 @@ def build_mcp(
         description: str | None = None,
         source: str | None = None,
     ) -> dict[str, Any]:
-        """Change an artifact's files: given files are added or replaced, `remove` deletes paths,
-        `html` replaces index.html. Every card and page showing it reloads. A new title renames
-        its folder. `shadow_files` (path, sha256, size) register big files to send afterwards
+        """Make a new version of an artifact: given files are added or replaced, `remove` deletes
+        paths, `html` replaces index.html. The old files stay as name@v<n>.ext, so older
+        versions remain readable. Every card and page showing the current version reloads.
+        A new title renames its folder. `shadow_files` (path, sha256, size) register big files to send afterwards
         with curl; the reply has their PUT links. Each change replaces the upload links."""
         st = reg.get(workspace)
         shadows = {s.path: s.model_dump() for s in shadow_files or []}
@@ -508,14 +517,17 @@ def build_mcp(
         return out
 
     @tool
-    async def get_artifact(workspace: str, artifact_id: str, include_content: bool = True) -> dict[str, Any]:
-        """An artifact and its files. Binary files come back base64-encoded."""
+    async def get_artifact(
+        workspace: str, artifact_id: str, version: int | None = None, include_content: bool = True
+    ) -> dict[str, Any]:
+        """An artifact and its files, as they are now or as they were in an older version.
+        Binary files come back base64-encoded."""
         st = reg.get(workspace)
-        return art_out(st, st.get_artifact(artifact_id, include_content))
+        return art_out(st, st.get_artifact(artifact_id, include_content, version))
 
     @tool
     async def list_artifacts(workspace: str) -> dict[str, Any]:
-        """All artifacts in a workspace: id (folder path), title, file count, size, address."""
+        """All artifacts in a workspace: id (folder path), title, version, file count, size, address."""
         st = reg.get(workspace)
         return {"artifacts": [art_out(st, a, links=False) for a in st.list_artifacts()]}
 

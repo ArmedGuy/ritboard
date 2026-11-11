@@ -295,3 +295,32 @@ def test_artifact_events_are_pushed(server):  # noqa: F811
     names = [n for n, _ in events]
     assert names[0] == "hello" and "db" in names and names.count("version") >= 2 and names[-1] == "deleted"
     assert json.loads(dict(events)["version"])["latest"] != hello
+
+
+def test_old_versions_have_addresses(server):  # noqa: F811
+    async def run():
+        async with Client(server + "/mcp") as c:
+            ov = data(await c.call_tool("create_workspace", {"name": "Versions"}))
+            ws, board = ov["workspace"]["id"], ov["boards"][0]["id"]
+            a = data(await c.call_tool("publish_artifact", {"workspace": ws, "title": "Page", "files": [
+                {"path": "index.html", "content": "<head></head><script src=app.js></script>one"},
+                {"path": "app.js", "content": "1"}]}))["artifact"]
+            v2 = data(await c.call_tool("update_artifact", {"workspace": ws, "artifact_id": "Page",
+                                                            "files": [{"path": "app.js", "content": "2"}]}))
+            assert v2["version"] == 2
+            old = a["url"].rstrip("/") + "@v1/"
+            assert httpx.get(old + "app.js").text == "1" and httpx.get(a["url"] + "app.js").text == "2"
+            page = httpx.get(old).text
+            assert "data-pinned" in page and "data-pinned" not in httpx.get(a["url"]).text
+            assert httpx.get(a["url"].rstrip("/") + "@v9/").status_code == 404
+            assert httpx.get(a["url"].rstrip("/") + "@x/").status_code == 404
+            got = data(await c.call_tool("get_artifact", {"workspace": ws, "artifact_id": "Page", "version": 1}))
+            assert got["version_url"] == old and {f["path"]: f["content"] for f in got["files"]}["app.js"] == "1"
+            view = data(await c.call_tool("place_findings", {"workspace": ws, "board_id": board,
+                                                             "placements": [{"finding_id": "Page@v1"}]}))
+            assert view["placements"][0]["title"] == "Page (version 1)"
+            # The page's database is the same for every version.
+            httpx.put(old + "_db/doc", params={"c": "c", "id": "d"}, json={"a": 1})
+            assert httpx.get(a["url"] + "_db", params={"c": "c"}).json()["docs"][0]["data"] == {"a": 1}
+
+    asyncio.run(run())

@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import Any
 
 from . import files as F
-from .store import Registry, WorkspaceStore
+from .store import Registry, WorkspaceStore, copy_name
 
 
 def _rows(db: sqlite3.Connection, sql: str, args: tuple = ()) -> list[sqlite3.Row]:
@@ -39,12 +39,13 @@ def _convert(db: sqlite3.Connection, st: WorkspaceStore, log: list[str]) -> None
     art_paths: dict[str, str] = {}
     paths: dict[str, str] = {}
 
-    def art_files(aid: str) -> dict[str, bytes]:
+    def art_files(aid: str, version: int, quiet: bool = False) -> dict[str, bytes]:
         a = arts[aid]
         files = {}
-        for r in _rows(db, "SELECT * FROM artifact_files WHERE artifact_id=? AND version=?", (aid, a["latest"])):
+        for r in _rows(db, "SELECT * FROM artifact_files WHERE artifact_id=? AND version=?", (aid, version)):
             if "pending" in r.keys() and r["pending"]:
-                log.append(f"  {a['title']}: {r['path']} was never uploaded; left out")
+                if not quiet:
+                    log.append(f"  {a['title']}: {r['path']} was never uploaded; left out")
                 continue
             files[r["path"]] = bytes(r["content"])
         entry = a.get("entry") or "index.html"
@@ -52,12 +53,27 @@ def _convert(db: sqlite3.Connection, st: WorkspaceStore, log: list[str]) -> None
             files["index.html"] = files[entry]
         return files
 
+    def keep_history(aid: str, path: str) -> None:
+        """Older versions become name@v<n>.ext copies, the same way new publishes keep them."""
+        latest = arts[aid]["latest"]
+        versions = {v: art_files(aid, v, quiet=True) for v in range(1, latest)}
+        versions[latest] = art_files(aid, latest, quiet=True)
+        for v in range(1, latest):
+            for rel, data in versions[v].items():
+                if versions[v + 1].get(rel) != data:
+                    target = st._target(path, copy_name(rel, v))
+                    F.write_bytes(target, data)
+        meta = st._meta_yaml()
+        meta.setdefault(path, {})["version"] = latest
+        st._save_meta_yaml(meta)
+        st.mark_dirty()
+
     def write_artifact(aid: str, title: str, parent: str | None, f: dict[str, Any] | None) -> str | None:
         if aid in art_paths:
             return art_paths[aid]
         if aid not in arts:
             return None
-        files = art_files(aid)
+        files = art_files(aid, arts[aid]["latest"])
         if "index.html" not in files:
             log.append(f"  {title}: artifact has no page; skipped")
             return None
@@ -72,6 +88,8 @@ def _convert(db: sqlite3.Connection, st: WorkspaceStore, log: list[str]) -> None
             }
         for coll, d in docs.items():
             st._save_coll(a["id"], coll, d)
+        if arts[aid]["latest"] > 1:
+            keep_history(aid, a["id"])
         art_paths[aid] = a["id"]
         return a["id"]
 
@@ -93,9 +111,7 @@ def _convert(db: sqlite3.Connection, st: WorkspaceStore, log: list[str]) -> None
                 aid, _, pin = (f["content"] or "").partition("@")
                 p = write_artifact(aid, f["title"], where, f)
                 if p:
-                    paths[f["id"]] = p
-                    if pin:
-                        log.append(f"  {f['title']}: was pinned to version {pin}; it now shows {p} as it is")
+                    paths[f["id"]] = f"{p}@v{pin}" if pin and pin.isdigit() and int(pin) < arts[aid]["latest"] else p
             else:
                 try:
                     out = st.add_finding(f["title"], f["content"], kind, where, f["category"], tags, f["source"])

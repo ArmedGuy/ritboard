@@ -180,3 +180,41 @@ def test_artifact_writes_stay_inside(reg, tmp_path):
         st.update_artifact(a["id"], {"data/x.json": b"{}"})
     assert not (outside / "x.json").exists()
     assert st.db_write(a["id"], "plan", "d", {"k": 1})["version"] == 1
+
+
+def test_artifact_versions_are_old_copies(reg):
+    st = reg.create("T")
+    bid = st.list_boards()[0]["id"]
+    a = st.create_artifact("Chart", {"index.html": b"one", "app.js": b"js", "old.css": b"css"})
+    assert a["version"] == 1
+    root = st.root / "Chart"
+
+    v2 = st.update_artifact("Chart", {"index.html": b"two", "app.js": b"js"}, remove=["old.css"])
+    assert v2["version"] == 2
+    assert sorted(p.name for p in root.iterdir() if not p.name.startswith(".")) == [
+        "app.js", "index.html", "index@v1.html", "old@v1.css"]  # app.js didn't change: no copy
+    assert {f["path"] for f in v2["files"]} == {"index.html", "app.js"}
+
+    st.update_artifact("Chart", {"index.html": b"three", "new.js": b"n"})
+    assert st.artifact_file("Chart", "index.html")[0] == b"three"
+    assert st.artifact_file("Chart", "index.html", 2)[0] == b"two"
+    assert st.artifact_file("Chart", "index.html", 1)[0] == b"one"
+    assert st.artifact_file("Chart", "app.js", 1)[0] == b"js"
+    assert st.artifact_file("Chart", "old.css", 1)[0] == b"css"
+    with pytest.raises(NotFound):
+        st.artifact_file("Chart", "old.css", 2)  # removed in version 2
+    old = st.get_artifact("Chart", with_content=True, version=1)
+    assert {f["path"]: f["content"] for f in old["files"]}["index.html"] == "one" and old["latest"] == 3
+    assert st.update_artifact("Chart", {"index.html": b"three"})["version"] == 3  # same content: no new version
+
+    with pytest.raises(ValueError, match="old versions"):
+        st.update_artifact("Chart", {"index@v9.html": b"x"})
+
+    # A card can show an older version, and it follows the artifact when it is renamed.
+    st.place(bid, [{"finding_id": "Chart@v1", "x": 5, "y": 5}, {"finding_id": "Chart"}])
+    st.update_finding("Chart", title="Step chart")
+    view = st.board_view(bid)
+    assert {p["finding_id"] for p in view["placements"]} == {"Step chart@v1", "Step chart"}
+    assert view["missing"] == []
+    with pytest.raises(NotFound):
+        st.place(bid, [{"finding_id": "Step chart@v9"}])

@@ -7,11 +7,12 @@
 // reloads it.) If the stream drops, the database falls back to polling.
 (() => {
   'use strict';
-  const m = location.pathname.match(/^(\/w\/[^/]+\/a\/[^/]+)\//);
+  const m = location.pathname.match(/^(\/w\/[^/]+\/a\/[^/@]+)(?:@v\d+)?\//);
   if (!m) return;
   const base = m[1] + '/_db';
   const me = document.currentScript;
   const loadedVersion = Number(me && me.dataset.version) || 0;  // state of the files this page came from
+  const pinned = !!(me && 'pinned' in me.dataset);  // opened as an older version: stays as it is
   let topLevel = true;
   try { topLevel = window.self === window.top; } catch { topLevel = false; }
   let live = false;  // event stream connected
@@ -157,12 +158,12 @@
     es.addEventListener('hello', (e) => {
       live = true;
       const { latest } = JSON.parse(e.data);
-      if (topLevel && loadedVersion && latest && latest !== loadedVersion) location.reload();
+      if (!pinned && topLevel && loadedVersion && latest && latest !== loadedVersion) location.reload();
     });
     es.addEventListener('db', () => { for (const c of collections.values()) c._kick(); });
     es.addEventListener('version', (e) => {
       const { latest } = JSON.parse(e.data);
-      if (topLevel && latest && latest !== loadedVersion) location.reload();
+      if (!pinned && topLevel && latest && latest !== loadedVersion) location.reload();
     });
     es.addEventListener('deleted', () => { es.close(); });
     es.onerror = () => { live = false; };  // EventSource retries by itself

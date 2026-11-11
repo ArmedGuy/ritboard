@@ -174,11 +174,29 @@ Drag findings from the tree onto the board to place them, or onto another findin
 ## Artifacts
 
 An artifact is a page or small site in a workspace: a folder with `index.html` plus any
-scripts, styles, data and images. There are no versions inside Ritboard; the folder's git
-history is the history.
+scripts, styles, data and images.
 
-- Address: `/w/<workspace>/a/<key>/`, where the key is made from the folder path and a
-  secret kept in Ritboard's settings folder, so it can't be guessed. Relative links between
+Every publish is a version. Before a file is replaced or removed, Ritboard keeps it next to
+the new one with the version in its name, so the folder holds every version without copying
+files that didn't change:
+
+```
+Sun map/
+  index.html          current (version 4)
+  index@v3.html       index.html as it was up to version 3
+  app.js              unchanged since version 1: no copies
+  data@v2.json        removed in version 3
+```
+
+`/w/<workspace>/a/<key>@v3/` is version 3: for each file Ritboard serves the first copy
+numbered 3 or higher, or the current file if there is none, so the page's relative links
+work unchanged. A card placed as `Sun map@v3` keeps showing version 3 (or use *Place an
+older version…* in the editor). The version number is kept in `meta.yaml`. Names like
+`name@v3.ext` are reserved for this. Editing the files directly on disk changes the current
+version without making a new one.
+
+- Address: `/w/<workspace>/a/<key>/` for the current version, where the key is made from the
+  folder path and a secret kept in Ritboard's settings folder, so it can't be guessed. Relative links between
   its files work. Renaming the folder changes the address.
 - Placed on a board, an artifact shows the page. When any of its files changes, from Ritboard
   or from an editor, every card showing it reloads. The ↗ in the card header opens it
@@ -244,8 +262,9 @@ message telling the agent to publish the HTML as a Ritboard artifact instead.
 Earlier versions kept each workspace in one `.sqlite` file in the settings folder. On its
 first start, `ritboard serve` turns each of them into a folder under `~/Ritboard` and moves
 the old file to `old-sqlite/` in the settings folder. `ritboard migrate` does the same by
-hand. Artifacts keep their latest version and their database; a note that had other notes
-under it becomes a folder holding the note and the others.
+hand. Artifacts keep all their versions (as `name@vN` copies) and their database, and cards
+pinned to a version stay pinned; a note that had other notes under it becomes a folder
+holding the note and the others.
 
 ## Service
 

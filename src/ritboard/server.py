@@ -161,10 +161,11 @@ _HEAD_OPEN = re.compile(rb"<head\b[^>]*>", re.I)
 _DOC_START = re.compile(rb"^\s*(<!doctype[^>]*>)?\s*(<html\b[^>]*>)?", re.I)
 
 
-def inject_runtime(html: bytes, src: str, stamp: int = 0) -> bytes:
+def inject_runtime(html: bytes, src: str, stamp: int = 0, pinned: bool = False) -> bytes:
     """Load the Ritboard runtime before any of the page's own scripts. It is told which
-    state of the files it was served from, so it can reload when they change."""
-    tag = f'<script src="{src}" data-version="{stamp}"></script>'.encode()
+    state of the files it was served from, so it can reload when they change. A page
+    opened as an older version (pinned) doesn't reload."""
+    tag = f'<script src="{src}" data-version="{stamp}"{" data-pinned" if pinned else ""}></script>'.encode()
     m = _HEAD_OPEN.search(html)
     if m:
         return html[: m.end()] + tag + html[m.end():]
@@ -461,8 +462,8 @@ def create_app(cfg: Config) -> FastAPI:
         return reg.get(ws).list_artifacts()
 
     @app.get("/api/w/{ws}/artifact")
-    async def get_artifact(ws: str, id: str, content: bool = False):
-        return reg.get(ws).get_artifact(id, content)
+    async def get_artifact(ws: str, id: str, content: bool = False, version: int | None = None):
+        return reg.get(ws).get_artifact(id, content, version)
 
     @app.post("/api/w/{ws}/artifacts")
     async def create_artifact(ws: str, body: ArtifactCreate):
@@ -517,7 +518,16 @@ def create_app(cfg: Config) -> FastAPI:
 
     def art(ws: str, key: str) -> tuple[Any, str]:
         st = reg.get(ws)
-        return st, st.artifact_by_key(key)
+        return st, st.artifact_by_key(key.split("@", 1)[0])
+
+    def art_version(key: str) -> int | None:
+        """'<key>@v3' is version 3; the plain key is the current version."""
+        _, _, v = key.partition("@")
+        if not v:
+            return None
+        if not (v.startswith("v") and v[1:].isdigit()):
+            raise NotFound("bad version in the address; use <key>@v3")
+        return int(v[1:])
 
     @app.options("/w/{ws}/a/{key}/_db")
     @app.options("/w/{ws}/a/{key}/_db/doc")
@@ -620,11 +630,12 @@ def create_app(cfg: Config) -> FastAPI:
         csp = {"Content-Security-Policy": ARTIFACT_CSP}
         try:
             st, aid = art(ws, key)
-            data, ctype = st.artifact_file(aid, path)
+            version = art_version(key)
+            data, ctype = st.artifact_file(aid, path, version)
         except (NotFound, ValueError) as e:
             return Response(str(e), status_code=404, media_type="text/plain", headers=csp)
         if ctype.startswith("text/html"):
-            data = inject_runtime(data, f"/w/{ws}/a/{key}/_ritboard.js", st.stamp(aid))
+            data = inject_runtime(data, f"/w/{ws}/a/{key.split('@', 1)[0]}/_ritboard.js", st.stamp(aid), pinned=version is not None)
         headers = {
             **csp,
             "Access-Control-Allow-Origin": "*",  # the sandboxed page fetches its own files from an opaque origin

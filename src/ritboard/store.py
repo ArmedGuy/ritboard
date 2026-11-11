@@ -160,6 +160,33 @@ def clean_art_path(path: str) -> str:
     return p
 
 
+_OLD_COPY = re.compile(r"^(?P<stem>[^/]+)@v(?P<n>\d+)(?P<ext>\.[A-Za-z0-9_-]+)?$")
+_PINNED = re.compile(r"^(?P<base>.+)@v(?P<n>\d+)$")
+
+
+def copy_name(rel: str, version: int) -> str:
+    """index.html as it was in version 3: index@v3.html (same folder)."""
+    folder, _, name = rel.rpartition("/")
+    stem, ext = (name.rsplit(".", 1)[0], "." + name.rsplit(".", 1)[1]) if "." in name.lstrip(".") else (name, "")
+    return f"{folder}/{stem}@v{version}{ext}" if folder else f"{stem}@v{version}{ext}"
+
+
+def old_copy(rel: str) -> tuple[str, int] | None:
+    """index@v3.html -> ("index.html", 3); None for an ordinary name."""
+    folder, _, name = rel.rpartition("/")
+    m = _OLD_COPY.match(name)
+    if not m:
+        return None
+    orig = m["stem"] + (m["ext"] or "")
+    return (f"{folder}/{orig}" if folder else orig), int(m["n"])
+
+
+def follows(key: str, old: str) -> bool:
+    """Does a board card or metadata key go with `old` when it moves? (itself, what is in
+    it, and cards pinned to a version of it)"""
+    return F.is_under(key, old) or (key.startswith(old + "@v") and key[len(old) + 2:].isdigit())
+
+
 def _stamp(items) -> int:
     """A number that changes when any of the (name, size, mtime) items change. 0 for none."""
     items = sorted(items)
@@ -464,7 +491,9 @@ class WorkspaceStore:
     def _tracked(self) -> set[str]:
         out: set[str] = set()
         for b in self._boards().values():
-            out.update(b["cards"])
+            for k in b["cards"]:
+                m = _PINNED.match(k)
+                out.add(m["base"] if m else k)
         out.update(self._meta_yaml())
         out.update(self._local_json("uploads.json", {}))
         return out
@@ -529,10 +558,10 @@ class WorkspaceStore:
         """A file or folder moved from old to new: boards, metadata and uploads follow."""
 
         def move(k: str) -> str:
-            return new + k[len(old):] if F.is_under(k, old) else k
+            return new + k[len(old):] if follows(k, old) else k
 
         for b in self._boards().values():
-            if any(F.is_under(k, old) for k in b["cards"]):
+            if any(follows(k, old) for k in b["cards"]):
                 b["cards"] = {move(k): v for k, v in b["cards"].items()}
                 self._save_board(b)
         meta = self._meta_yaml()
@@ -847,8 +876,8 @@ class WorkspaceStore:
     def _forget(self, path: str) -> None:
         """Take a removed path (and everything under it) off the boards and out of the metadata."""
         for b in self._boards().values():
-            if any(F.is_under(k, path) for k in b["cards"]):
-                b["cards"] = {k: v for k, v in b["cards"].items() if not F.is_under(k, path)}
+            if any(follows(k, path) for k in b["cards"]):
+                b["cards"] = {k: v for k, v in b["cards"].items() if not follows(k, path)}
                 self._save_board(b)
         meta = self._meta_yaml()
         if any(F.is_under(k, path) for k in meta):
@@ -993,6 +1022,18 @@ class WorkspaceStore:
         self.changed("boards")
 
     # ---- placements -----------------------------------------------------
+    def _card(self, fid: str) -> tuple[Entry, int | None] | None:
+        """What a card shows: a finding, or a version of an artifact ("Report@v3")."""
+        e = self._entries.get(fid)
+        if e:
+            return e, None
+        m = _PINNED.match(fid)
+        if m:
+            b = self._entries.get(m["base"])
+            if b and b.kind == "artifact" and 1 <= int(m["n"]) <= self._art_version(b):
+                return b, int(m["n"])
+        return None
+
     def placements(self, bid: str | None = None) -> list[dict[str, Any]]:
         self._fresh()
         boards = [self._board(bid)] if bid else list(self._boards().values())
@@ -1000,7 +1041,7 @@ class WorkspaceStore:
         for b in boards:
             for fid, (x, y, w, h, z) in sorted(b["cards"].items(), key=lambda kv: kv[1][4]):
                 p = {"board_id": b["id"], "finding_id": fid, "x": x, "y": y, "w": w, "h": h, "z": z}
-                if fid not in self._entries:
+                if self._card(fid) is None:
                     p["missing"] = True
                 out.append(p)
         return out
@@ -1032,10 +1073,14 @@ class WorkspaceStore:
             for it in items:
                 fid = str(it["finding_id"]).replace("\\", "/").strip("/")
                 cur = b["cards"].get(fid)
-                if cur is None:
-                    kind = self._entry(fid).kind
-                else:
-                    kind = self._entries[fid].kind if fid in self._entries else "md"
+                card = self._card(fid)
+                if card is None and cur is None:
+                    self._fresh(force=True)
+                    card = self._card(fid)
+                    if card is None:
+                        self._entry(fid)  # raises the usual not-found message
+                        raise NotFound(f"{fid}: no such version")
+                kind = card[0].kind if card else "md"
                 dw, dh = DEFAULT_SIZES.get(kind, (420, 300))
                 w = int(it.get("w") or (cur[2] if cur else dw))
                 h = int(it.get("h") or (cur[3] if cur else dh))
@@ -1104,7 +1149,8 @@ class WorkspaceStore:
             raise ValueError(f"{e.path} is a {e.kind}, not an artifact (a folder with index.html)")
         return e
 
-    def _art_files(self, aid: str) -> list[tuple[str, Path, os.stat_result]]:
+    def _art_all(self, aid: str) -> list[tuple[str, Path, os.stat_result]]:
+        """Every file in the artifact folder, old copies included."""
         base = self.root / aid
         out = []
         for dirpath, dirnames, filenames in os.walk(base):
@@ -1122,6 +1168,32 @@ class WorkspaceStore:
                 out.append((p.relative_to(base).as_posix(), p, st))
         return out
 
+    def _art_files(self, aid: str) -> list[tuple[str, Path, os.stat_result]]:
+        """The artifact's current files."""
+        return [f for f in self._art_all(aid) if not old_copy(f[0])]
+
+    def _art_copies(self, aid: str) -> dict[str, list[tuple[int, str]]]:
+        """Old copies by the file they were: {"index.html": [(3, "index@v3.html")]}, oldest first."""
+        out: dict[str, list[tuple[int, str]]] = {}
+        for rel, _, _ in self._art_all(aid):
+            oc = old_copy(rel)
+            if oc:
+                out.setdefault(oc[0], []).append((oc[1], rel))
+        for v in out.values():
+            v.sort()
+        return out
+
+    def _art_version(self, e: Entry, copies: dict[str, list[tuple[int, str]]] | None = None) -> int:
+        """The current version: what meta.yaml says, but never behind the old copies."""
+        if copies is None:
+            copies = self._art_copies(e.path)
+        newest_copy = max((n for v in copies.values() for n, _ in v), default=0)
+        try:
+            said = int(e.meta.get("version") or 1)
+        except (TypeError, ValueError):
+            said = 1
+        return max(said, newest_copy + 1, 1)
+
     def _target(self, aid: str, rel: str) -> Path:
         """Where to write a file of an artifact: never through a link to somewhere outside it."""
         base = (self.root / aid).resolve()
@@ -1134,15 +1206,17 @@ class WorkspaceStore:
         return dict((self._local_json("uploads.json", {}).get(aid) or {}).get("pending") or {})
 
     def _art_summary(self, e: Entry) -> dict[str, Any]:
-        files = self._art_files(e.path)
+        everything = self._art_all(e.path)
+        files = [f for f in everything if not old_copy(f[0])]
         pending = self._pending(e.path)
         latest = max([st.st_mtime_ns for _, _, st in files], default=e.mtime_ns)
         return {
             "url": self.art_url(e.path),
+            "version": self._art_version(e),
             "files": len(files) + sum(1 for p in pending if not any(r == p for r, _, _ in files)),
             "bytes": sum(st.st_size for r, _, st in files if r not in pending) + sum(int(v[1]) for v in pending.values()),
             "pending": len(pending),
-            "stamp": _stamp([[r, st.st_size, st.st_mtime_ns] for r, _, st in files] + [[f"pending:{p}", 0, 0] for p in pending]),
+            "stamp": _stamp([[r, st.st_size, st.st_mtime_ns] for r, _, st in everything] + [[f"pending:{p}", 0, 0] for p in pending]),
             "updated_at": iso(latest),
         }
 
@@ -1158,14 +1232,36 @@ class WorkspaceStore:
         arts = [self.artifact_meta(e.path) for e in self._entries.values() if e.kind == "artifact"]
         return sorted(arts, key=lambda a: a["updated_at"], reverse=True)
 
-    def get_artifact(self, aid: str, with_content: bool = False) -> dict[str, Any]:
+    def _resolve(self, aid: str, rel: str, version: int | None, copies, current: set[str]) -> str | None:
+        """Which file holds `rel` as it was in `version` (None: now)."""
+        if version is not None:
+            later = [c for n, c in copies.get(rel, []) if n >= version]
+            if later:
+                return later[0]
+        return rel if rel in current else None
+
+    def get_artifact(self, aid: str, with_content: bool = False, version: int | None = None) -> dict[str, Any]:
         a = self.artifact_meta(aid)
-        pending = self._pending(a["id"])
+        e = self._art(aid)
+        copies = self._art_copies(a["id"])
+        latest = self._art_version(e, copies)
+        if version is not None and not 1 <= version <= latest:
+            raise NotFound(f"artifact {a['id']} has versions 1 to {latest}")
+        if version == latest:
+            version = None
+        pending = self._pending(a["id"]) if version is None else {}
+        current = {rel: (p, st) for rel, p, st in self._art_files(a["id"])}
         files = []
-        for rel, p, st in self._art_files(a["id"]):
+        for rel in sorted(set(current) | set(copies)):
             if rel in pending:
                 continue
-            f: dict[str, Any] = {"path": rel, "content_type": content_type(rel), "size": st.st_size}
+            src = self._resolve(a["id"], rel, version, copies, set(current))
+            if src is None:
+                continue
+            p = self.root / a["id"] / src
+            f: dict[str, Any] = {"path": rel, "content_type": content_type(rel), "size": p.stat().st_size}
+            if src != rel:
+                f["stored_as"] = src
             if with_content:
                 data = p.read_bytes()
                 ct = f["content_type"]
@@ -1177,16 +1273,25 @@ class WorkspaceStore:
         for rel, (h, size) in sorted(pending.items()):
             files.append({"path": rel, "content_type": content_type(rel), "size": size, "pending": True, "sha256": h})
         files.sort(key=lambda f: f["path"])
-        return {**a, "entry": "index.html", "files": files}
+        return {**a, "version": version or latest, "latest": latest, "entry": "index.html", "files": files}
 
-    def artifact_file(self, aid: str, path: str) -> tuple[bytes, str]:
+    def artifact_file(self, aid: str, path: str, version: int | None = None) -> tuple[bytes, str]:
         rel = clean_art_path(path or "index.html")
-        if rel in self._pending(aid):
+        e = self._art(aid)
+        copies = self._art_copies(e.path)
+        if version is not None:
+            latest = self._art_version(e, copies)
+            if not 1 <= version <= latest:
+                raise NotFound(f"artifact {e.path} has versions 1 to {latest}")
+            if version == latest:
+                version = None
+        if version is None and rel in self._pending(e.path):
             raise NotFound(f"{rel} has not been uploaded yet")
-        base = (self.root / aid).resolve()
-        p = (base / rel).resolve()
-        if not p.is_relative_to(base) or not p.is_file():
-            raise NotFound(f"{rel} not in artifact {aid}")
+        base = (self.root / e.path).resolve()
+        src = self._resolve(e.path, rel, version, copies, {rel} if (base / rel).is_file() else set())
+        p = (base / src).resolve() if src else None
+        if p is None or not p.is_relative_to(base) or not p.is_file():
+            raise NotFound(f"{rel} not in artifact {aid}" + (f" version {version}" if version else ""))
         return p.read_bytes(), content_type(rel)
 
     @staticmethod
@@ -1211,11 +1316,11 @@ class WorkspaceStore:
         self._save_local_json("uploads.json", ups)
 
     def _fill_from_existing(self, aid: str, pending: dict[str, list]) -> None:
-        """Shadow files whose content the artifact already has are filled at once."""
+        """Shadow files whose content the artifact already has (old copies too) are filled at once."""
         if not pending:
             return
         by_size: dict[int, list[Path]] = {}
-        for rel, p, st in self._art_files(aid):
+        for rel, p, st in self._art_all(aid):
             if rel not in pending:
                 by_size.setdefault(st.st_size, []).append(p)
         for rel, (h, size) in list(pending.items()):
@@ -1227,11 +1332,19 @@ class WorkspaceStore:
                     break
 
     def _check_size(self, aid: str | None, files: dict[str, bytes], shadow: dict[str, tuple[str, int]], drop: set[str]) -> None:
+        """The limit is on the current files; old copies don't count."""
         total = sum(len(b) for b in files.values()) + sum(s for _, s in shadow.values())
         if aid:
             total += sum(st.st_size for rel, _, st in self._art_files(aid) if rel not in files and rel not in shadow and rel not in drop)
         if total > ARTIFACT_MAX_BYTES:
             raise ValueError(f"artifact would be {total} bytes; the limit is {ARTIFACT_MAX_BYTES}")
+
+    @staticmethod
+    def _publishable(rel: str) -> str:
+        rel = clean_art_path(rel)
+        if old_copy(rel):
+            raise ValueError(f"{rel}: names like name@v3.ext are where Ritboard keeps old versions; pick another name")
+        return rel
 
     def create_artifact(
         self,
@@ -1246,8 +1359,8 @@ class WorkspaceStore:
         category: str | None = None,
         tags: list[str] | None = None,
     ) -> dict[str, Any]:
-        files = {clean_art_path(p): b for p, b in files.items()}
-        shadow = {clean_art_path(p): self._shadow(s) for p, s in (shadows or {}).items()}
+        files = {self._publishable(p): b for p, b in files.items()}
+        shadow = {self._publishable(p): self._shadow(s) for p, s in (shadows or {}).items()}
         if set(files) & set(shadow):
             raise ValueError(f"given both with content and as a shadow file: {', '.join(sorted(set(files) & set(shadow)))}")
         if (entry or "index.html") != "index.html":
@@ -1269,6 +1382,7 @@ class WorkspaceStore:
             self._set_yaml_meta(path, {
                 "title": self._title_meta(title, path, True), "description": description or None,
                 "category": category or None, "tags": list(tags or []) or None, "source": source or None,
+                "version": 1,
             })
             pending = {p: [h, s] for p, (h, s) in shadow.items()}
             self._fill_from_existing(path, pending)
@@ -1277,6 +1391,12 @@ class WorkspaceStore:
             self._dirty = True
         self.changed("artifacts")
         return self.get_artifact(path)
+
+    def _keep_old(self, aid: str, rel: str, version: int) -> None:
+        """Before a file is replaced or removed, keep it as name@v<version>.ext."""
+        src = self._target(aid, rel)
+        if src.is_file():
+            os.replace(src, self._target(aid, copy_name(rel, version)))
 
     def update_artifact(
         self,
@@ -1290,15 +1410,16 @@ class WorkspaceStore:
         source: str | None = None,
         shadows: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
-        """Write the given files into the artifact folder, register shadow files, delete the
-        paths in `remove`. Every change to files replaces the upload secret."""
+        """Make a new version: write the given files, register shadow files, delete the paths
+        in `remove`. Files that change or go are kept as name@v<old version>.ext first, so
+        older versions stay readable. Every change to files replaces the upload secret."""
         if entry and entry != "index.html":
             raise ValueError("an artifact's page must be index.html")
-        new_files = {clean_art_path(p): b for p, b in (files or {}).items()}
-        new_shadow = {clean_art_path(p): self._shadow(s) for p, s in (shadows or {}).items()}
+        new_files = {self._publishable(p): b for p, b in (files or {}).items()}
+        new_shadow = {self._publishable(p): self._shadow(s) for p, s in (shadows or {}).items()}
         if set(new_files) & set(new_shadow):
             raise ValueError("a path is given both with content and as a shadow file")
-        drop = {clean_art_path(p) for p in (remove or [])}
+        drop = {self._publishable(p) for p in (remove or [])}
         if "index.html" in drop and "index.html" not in new_files and "index.html" not in new_shadow:
             raise ValueError("index.html can't be removed; it is what makes the folder an artifact")
         with self._lock:
@@ -1310,33 +1431,43 @@ class WorkspaceStore:
             if missing:
                 raise ValueError(f"not in the artifact: {', '.join(sorted(missing))}")
             self._check_size(aid, new_files, new_shadow, drop)
-            base = self.root / aid
+            cur = self._art_version(e)
+            changed = False
             for rel in drop:
                 pending.pop(rel, None)
-                p = self._target(aid, rel)
-                if p.is_file():
-                    p.unlink()
+                self._keep_old(aid, rel, cur)
+                changed = True
             for rel, data in new_files.items():
-                F.write_bytes(self._target(aid, rel), data)
+                p = self._target(aid, rel)
+                if rel not in pending and p.is_file() and p.stat().st_size == len(data) and p.read_bytes() == data:
+                    continue  # unchanged
+                self._keep_old(aid, rel, cur)
+                F.write_bytes(p, data)
                 pending.pop(rel, None)
+                changed = True
             for rel, (h, s) in new_shadow.items():
+                p = self._target(aid, rel)
+                if rel not in pending and p.is_file() and p.stat().st_size == s and hashlib.sha256(p.read_bytes()).hexdigest() == h:
+                    continue  # already this content
+                self._keep_old(aid, rel, cur)
                 pending[rel] = [h, s]
-            changed_files = bool(new_files or new_shadow or drop)
-            if changed_files:
+                changed = True
+            meta = dict(e.meta)
+            if changed:
                 self._fill_from_existing(aid, pending)
                 self._set_uploads(aid, pending, rotate=True)
-            if description is not None or source is not None:
-                meta = dict(e.meta)
-                if description is not None:
-                    meta["description"] = description or None
-                if source is not None:
-                    meta["source"] = source or None
+                meta["version"] = cur + 1
+            if description is not None:
+                meta["description"] = description or None
+            if source is not None:
+                meta["source"] = source or None
+            if meta != e.meta:
                 self._set_yaml_meta(aid, meta)
             self._dirty = True
         if title is not None and title.strip() and title.strip() != self._title(e):
             aid = self.update_finding(aid, title=title)["id"]
         self.changed("artifacts")
-        if changed_files:
+        if changed:
             self._art_event(aid, "version")
         return self.get_artifact(aid)
 
@@ -1530,11 +1661,12 @@ class WorkspaceStore:
         board = self.get_board_row(bid)
         placed = []
         for p in self.placements(board["id"]):
-            e = self._entries.get(p["finding_id"])
+            card = self._card(p["finding_id"])
+            e, pin = card if card else (None, None)
             out = p["x"] < 0 or p["y"] < 0 or p["x"] + p["w"] > board["width"] or p["y"] + p["h"] > board["height"]
             item = {
                 "finding_id": p["finding_id"],
-                "title": self._title(e) if e else p["finding_id"],
+                "title": (self._title(e) + (f" (version {pin})" if pin else "")) if e else p["finding_id"],
                 "kind": e.kind if e else "missing",
                 "category": (e.meta.get("category") or None) if e else None,
                 **{k: p[k] for k in ("x", "y", "w", "h", "z")},
