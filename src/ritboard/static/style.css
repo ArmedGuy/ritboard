@@ -81,6 +81,7 @@ button, input, select, textarea { font: inherit; color: inherit; }
 .card.flash { animation: flash .9s ease-out; }
 @keyframes flash { 0% { outline: 6px solid var(--sel); outline-offset: 6px; } 100% { outline: 2px solid transparent; outline-offset: 2px; } }
 .card.oob { border-style: dashed; border-color: var(--danger); }
+.card.missing { border-style: dashed; opacity: .7; }
 .card-head {
   flex: none; display: flex; align-items: center; gap: 8px; height: 30px; padding: 0 8px 0 9px;
   border-bottom: 1px solid var(--card-line); cursor: move; user-select: none; background: var(--card-head);

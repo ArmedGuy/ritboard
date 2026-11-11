@@ -60,7 +60,7 @@
           <option value="md">Markdown</option>
           <option value="text">Plain text</option>
           <option value="csv">Table (CSV)</option>
-          <option value="artifact">Artifact (page with versions)</option>
+          <option value="artifact">Artifact (a page in its own folder)</option>
           <option value="html">HTML snippet</option>
           <option value="url">Web page (URL)</option>
           <option value="image">Image</option>
@@ -121,9 +121,10 @@
         <label>New board height <input name="w_bh" type="number" min="100"></label>
       </div>
       <div id="set-cats"></div>
+      <p class="hint">Folder: <span id="set-folder" class="copy"></span></p>
       <div class="row-actions">
         <button type="button" id="set-ws-apply" class="primary">Apply to workspace</button>
-        <button type="button" id="set-ws-delete" class="danger">Delete workspace</button>
+        <button type="button" id="set-ws-delete" class="danger">Remove from list</button>
       </div>
     </section>
 
@@ -156,7 +157,7 @@
       <code id="set-mcp" class="copy"></code>
       <p class="hint">Claude Code:</p>
       <code id="set-cc" class="copy"></code>
-      <p class="hint">Data folder: <span id="set-data"></span></p>
+      <p class="hint">Ritboard settings folder: <span id="set-data"></span></p>
     </section>
   </form>
 </dialog>

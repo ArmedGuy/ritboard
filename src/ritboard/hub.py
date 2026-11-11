@@ -19,6 +19,7 @@ class Hub:
         self.clients: dict[WebSocket, str | None] = {}
         self.loop: asyncio.AbstractEventLoop | None = None
         self.artifact_subs: dict[tuple[str, str], set[asyncio.Queue]] = {}
+        self.workspaces_changed: asyncio.Event | None = None  # wakes the folder watcher
 
     def watch_artifact(self, workspace: str, aid: str) -> asyncio.Queue:
         q: asyncio.Queue = asyncio.Queue(maxsize=100)
@@ -80,6 +81,8 @@ class Hub:
             _, kind, aid = what.split(":", 2)
             loop.call_soon_threadsafe(self._to_artifact_pages, workspace, kind, aid)
             return
+        if workspace == "*" and self.workspaces_changed is not None:
+            loop.call_soon_threadsafe(self.workspaces_changed.set)
         try:
             running = asyncio.get_running_loop()
         except RuntimeError:

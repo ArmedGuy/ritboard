@@ -21,10 +21,14 @@ def _port():
         return s.getsockname()[1]
 
 
+def _config(tmp, **kw):
+    return Config(data_dir=tmp / "data", workspaces_dir=tmp / "ws", file_roots=[tmp], **kw)
+
+
 @pytest.fixture(scope="module")
 def server(tmp_path_factory):
     port = _port()
-    app = create_app(Config(data_dir=tmp_path_factory.mktemp("data"), port=port))
+    app = create_app(_config(tmp_path_factory.mktemp("srv"), port=port))
     srv = uvicorn.Server(uvicorn.Config(app, host="127.0.0.1", port=port, log_level="warning"))
     t = threading.Thread(target=srv.run, daemon=True)
     t.start()
@@ -108,8 +112,14 @@ def test_rest_and_ui_assets(server):
     p = httpx.put(f"{server}/api/w/{ws['id']}/boards/{bid}/placements", json=[{"finding_id": f["id"], "x": 5, "y": 6, "w": 300, "h": 200}]).json()
     assert p[0]["x"] == 5
     assert httpx.post(f"{server}/api/w/{ws['id']}/boards/{bid}/unplace", json=[f["id"]]).json()["removed"] == 1
-    assert httpx.get(f"{server}/api/w/{ws['id']}/findings/zzz").status_code in (404, 405)
-    assert httpx.patch(f"{server}/api/w/{ws['id']}/findings/zzz", json={"title": "x"}).status_code == 404
+    assert httpx.get(f"{server}/api/w/{ws['id']}/finding", params={"id": "zzz"}).status_code == 404
+    assert httpx.patch(f"{server}/api/w/{ws['id']}/finding", params={"id": "zzz"}, json={"title": "x"}).status_code == 404
+    r = httpx.patch(f"{server}/api/w/{ws['id']}/finding", params={"id": f["id"]}, json={"title": "renamed"})
+    assert r.json()["id"] == "renamed.md"
+    assert httpx.get(f"{server}/api/w/{ws['id']}/raw", params={"path": "../secret"}).status_code == 400
+    assert httpx.get(f"{server}/api/w/{ws['id']}/raw", params={"path": ".ritboard/workspace.yaml"}).status_code == 400
+    raw = httpx.get(f"{server}/api/w/{ws['id']}/raw", params={"path": "renamed.md"})
+    assert raw.status_code == 200 and raw.headers["content-security-policy"] == "sandbox"
     httpx.post(server + "/api/ui", json={"workspace": ws["id"], "board": bid})
 
     async def cur():
@@ -121,7 +131,7 @@ def test_rest_and_ui_assets(server):
 
 def test_token_gate(tmp_path):
     port = _port()
-    app = create_app(Config(data_dir=tmp_path, host="127.0.0.1", port=port, token="s3cret"))
+    app = create_app(_config(tmp_path, host="127.0.0.1", port=port, token="s3cret"))
     srv = uvicorn.Server(uvicorn.Config(app, host="127.0.0.1", port=port, log_level="warning"))
     t = threading.Thread(target=srv.run, daemon=True)
     t.start()
@@ -144,7 +154,7 @@ def test_token_gate(tmp_path):
 
 def test_token_gate_lets_artifact_pages_through(tmp_path):
     port = _port()
-    app = create_app(Config(data_dir=tmp_path, host="127.0.0.1", port=port, token="s3cret"))
+    app = create_app(_config(tmp_path, host="127.0.0.1", port=port, token="s3cret"))
     srv = uvicorn.Server(uvicorn.Config(app, host="127.0.0.1", port=port, log_level="warning"))
     t = threading.Thread(target=srv.run, daemon=True)
     t.start()
@@ -158,9 +168,11 @@ def test_token_gate_lets_artifact_pages_through(tmp_path):
             time.sleep(0.05)
     try:
         ws = httpx.post(url + "/api/workspaces", json={"name": "T"}, headers=auth).json()["id"]
-        aid = httpx.post(f"{url}/api/w/{ws}/artifacts", json={"title": "P", "files": {"index.html": "ok"}}, headers=auth).json()["artifact"]["id"]
-        assert httpx.get(f"{url}/w/{ws}/a/{aid}/").text.endswith("ok")
-        assert httpx.put(f"{url}/w/{ws}/a/{aid}/_db/doc", params={"c": "p", "id": "d"}, json={"a": 1}).status_code == 200
+        page = httpx.post(f"{url}/api/w/{ws}/artifacts", json={"title": "P", "files": {"index.html": "ok"}}, headers=auth).json()["artifact"]["url"]
+        assert len(page.split("/")[4]) == 24  # an unguessable key, not the folder name
+        assert httpx.get(url + page).text.endswith("ok")
+        assert httpx.put(url + page + "_db/doc", params={"c": "p", "id": "d"}, json={"a": 1}).status_code == 200
+        assert httpx.get(f"{url}/w/{ws}/a/{'0' * 24}/").status_code == 404
         assert httpx.get(f"{url}/api/w/{ws}/artifacts").status_code == 401
         assert httpx.put(f"{url}/w/{ws}/u/notatoken/{'0' * 64}", content=b"x").status_code == 404  # reached the app, not 401
     finally:
@@ -187,3 +199,56 @@ def test_host_guard(server):
 
     assert asyncio.run(ws_from("http://evil.example")) != "open"
     assert asyncio.run(ws_from(server)) == "open"
+
+
+def _wait_msg(sock, ws, timeout=6):
+    async def go():
+        end = time.time() + timeout
+        while time.time() < end:
+            msg = json.loads(await asyncio.wait_for(sock.recv(), end - time.time()))
+            if msg.get("workspace") == ws:
+                return msg
+    return go()
+
+
+def test_folder_changes_are_pushed(server):
+    ws = httpx.post(server + "/api/workspaces", json={"name": "Watched"}).json()
+    root = __import__("pathlib").Path(ws["path"])
+    bid = httpx.get(f"{server}/api/w/{ws['id']}/state").json()["boards"][0]["id"]
+
+    async def run():
+        async with websockets.connect(server.replace("http", "ws") + "/ws") as sock:
+            await sock.send(json.dumps({"subscribe": ws["id"]}))
+            await asyncio.sleep(1)  # let the folder watcher start on the new workspace
+            (root / "from-editor.md").write_text("# written outside Ritboard\nonly here")
+            msg = await _wait_msg(sock, ws["id"])
+            assert msg and msg["type"] == "changed"
+            st = httpx.get(f"{server}/api/w/{ws['id']}/state").json()
+            assert "from-editor.md" in {f["id"] for f in st["findings"]}
+
+            httpx.put(f"{server}/api/w/{ws['id']}/boards/{bid}/placements", json=[{"finding_id": "from-editor.md", "x": 5, "y": 6}])
+            (root / "Moved").mkdir()
+            (root / "from-editor.md").rename(root / "Moved" / "from-editor.md")
+            for _ in range(40):
+                st = httpx.get(f"{server}/api/w/{ws['id']}/state").json()
+                if st["placements"] and st["placements"][0]["finding_id"] == "Moved/from-editor.md":
+                    break
+                await asyncio.sleep(0.1)
+            assert st["placements"][0]["finding_id"] == "Moved/from-editor.md" and st["placements"][0]["x"] == 5
+
+    asyncio.run(run())
+
+
+def test_open_folder_over_rest(server, tmp_path_factory):
+    folder = tmp_path_factory.mktemp("srv-open")
+    (folder / "a.md").write_text("hi")
+    r = httpx.post(server + "/api/workspaces/open", json={"path": str(folder)})
+    assert r.status_code == 400 and "outside the folders" in r.json()["detail"]
+    data_root = httpx.get(server + "/api/workspaces").json()[0]["path"]
+    inside = __import__("pathlib").Path(data_root).parent / "project"
+    inside.mkdir()
+    (inside / "a.md").write_text("hi")
+    w = httpx.post(server + "/api/workspaces/open", json={"path": str(inside)}).json()
+    assert w["findings"] == 1
+    assert httpx.delete(f"{server}/api/workspaces/{w['id']}").json()["folder_kept"] == str(inside.resolve())
+    assert (inside / "a.md").exists()

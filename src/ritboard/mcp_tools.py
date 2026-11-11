@@ -11,26 +11,33 @@ from mcp.server.mcpserver import MCPServer
 from mcp.server.mcpserver.exceptions import ToolError
 from pydantic import BaseModel, Field
 
-from .store import ARTIFACT_MAX_BYTES, Registry
+from .store import ARTIFACT_MAX_BYTES, Registry, check_workspace_folder
 
 INSTRUCTIONS = """\
 Ritboard is a big-screen planning board. Use it to post findings, sort them, and lay them out.
 
 Model:
-- A workspace is one project. Every data tool takes `workspace` (id or name). Call
-  list_workspaces first, or current_workspace to get the one open on screen.
-- A finding is an item in the workspace tree (left sidebar). It has a title, a kind, content,
-  an optional category and tags, and an optional parent (to make a tree). Kinds:
-  md (markdown, tables allowed), text, csv (rendered as a table), html (a one-off HTML
-  snippet in a sandboxed frame), artifact (a card showing an artifact, see below),
-  url (an external page in a frame), image (URL or data URI), folder (a grouping node).
-- An artifact is a small website kept in the workspace: index.html plus any scripts, styles,
-  data or images, with numbered versions and its own address. Use publish_artifact for any
-  page, app, chart or report worth revising; update_artifact makes a new version and every
-  card showing it reloads. Relative links between its files work. Pages run sandboxed: no
-  access to Ritboard's API, no cookies or localStorage; libraries from CDNs load normally.
-  Each artifact has its own small database, reached from the page the same way as in
-  claude.ai artifacts: `const db = await window.claude.use("db");` then
+- A workspace is a folder of ordinary files (often a git repository). Every data tool takes
+  `workspace` (id or name). Call list_workspaces first, or current_workspace for the one open
+  on screen. Each workspace reports its folder `path`.
+- A finding is a file or folder in that folder, and its id is its path inside it, like
+  "Network/nccl-stalls.md". Folders make the tree in the sidebar. The kind follows the file
+  type: md (Markdown, tables allowed), text (.txt and code or data files), csv (shown as a
+  table), html (a one-off HTML snippet in a sandboxed frame), url (.url: an external page in a
+  frame), image (image files, or an image URL), folder, artifact (see below), file (other).
+  A finding's title is its file name unless metadata says otherwise. Markdown keeps title,
+  category, tags and source in YAML front matter; other files keep them in
+  .ritboard/meta.yaml. Renaming or moving a finding renames or moves its file.
+- If you can write to that folder directly, you may: new or changed files show up on the
+  board by themselves while Ritboard runs. Use these tools for placing cards on boards.
+- An artifact is a folder with index.html plus any scripts, styles, data or images: a small
+  website with its own address. Use publish_artifact for any page, app, chart or report worth
+  revising; update_artifact changes its files and every card showing it reloads. Relative links
+  between its files work. Pages run sandboxed: no access to Ritboard's API, no cookies or
+  localStorage; libraries from CDNs load normally. There is no version history inside
+  Ritboard; the workspace's git history is the history.
+  Each artifact has its own small database (JSON files in its .data folder), reached from the
+  page the same way as in claude.ai artifacts: `const db = await window.claude.use("db");` then
   `db.collection("plan").doc(id).set({...})`, `.update()`, `.delete()`, `.get()`,
   `collection.add()`, `collection.get()` and `collection.onSnapshot(snap => snap.docChanges())`.
   Other claude.ai capabilities (window.claude.complete, user, assets) don't exist here.
@@ -46,12 +53,11 @@ Model:
 - Never post claude.ai or claude.site links (Claude artifacts) as url cards; they are refused,
   because claude.ai can't be shown inside another page. Publish the artifact's HTML with
   publish_artifact instead: get the HTML (from your own output, or by reading the artifact)
-  and pass it as html=... or as files. To fix an existing claude.ai card, publish the HTML,
-  then update_finding that card to kind="artifact", content=<new artifact id>; it keeps its
-  place on the boards.
+  and pass it as html=... or as files. Then put the new artifact where the old card was
+  (place_findings) and delete the old card.
 - A board is a tab with a fixed pixel size (e.g. 3840x2160). A finding only shows on a board
   once placed there. Coordinates are exact board pixels, origin top-left. Leave x/y out and
-  Ritboard picks a free spot.
+  Ritboard picks a free spot. Boards are YAML files in .ritboard/boards/.
 Prefer content you write yourself (md, artifacts) over external URLs; many sites refuse framing.
 Read get_board before rearranging so you don't stack cards on top of each other.
 """
@@ -61,13 +67,13 @@ class FindingIn(BaseModel):
     title: str
     content: str = ""
     kind: str = Field("md", description="md, text, csv, html, url, image or folder")
-    parent_id: str | None = None
+    parent_id: str | None = Field(None, description="Folder to put it in (its path); omit for the top level")
     category: str | None = None
     tags: list[str] | None = None
 
 
 class PlacementIn(BaseModel):
-    finding_id: str
+    finding_id: str = Field(description="The finding's path, e.g. Notes/idea.md")
     x: int | None = Field(None, description="Left edge in board pixels. Omit with y to auto-place.")
     y: int | None = Field(None, description="Top edge in board pixels.")
     w: int | None = Field(None, description="Width in pixels. Default depends on kind.")
@@ -134,7 +140,9 @@ def read_local(path: str, roots: list[Path]) -> bytes:
 def build_mcp(
     reg: Registry, ui_state: dict[str, Any], base_url: str = "", file_roots: list[Path] | None = None
 ) -> MCPServer:
+    """base_url "" means no server is running (the stdio bridge working on the files directly)."""
     roots = list(file_roots or [])
+    offline = not base_url
     mcp = MCPServer("ritboard", title="Ritboard", instructions=INSTRUCTIONS)
 
     def tool(fn):
@@ -145,20 +153,21 @@ def build_mcp(
         async def wrapper(*args, **kwargs):
             try:
                 return await fn(*args, **kwargs)
-            except (ValueError, LookupError) as e:
+            except (ValueError, LookupError, OSError) as e:
                 raise ToolError(str(e)) from e
 
         return mcp.tool()(wrapper)
 
-    def art_url(ws: str, aid: str, version: int | None = None) -> str:
-        return f"{base_url}/w/{ws}/a/{aid}{'@' + str(version) if version else ''}/"
-
-    def art_out(ws: str, a: dict[str, Any], links: bool = True) -> dict[str, Any]:
-        a = {k: v for k, v in a.items() if k != "versions"}
-        a["url"] = art_url(ws, a["id"])
-        a["version_url"] = art_url(ws, a["id"], a["latest"])
+    def art_out(st, a: dict[str, Any], links: bool = True) -> dict[str, Any]:
+        a = dict(a)
+        a.pop("stamp", None)
+        if offline:
+            a["url"] = None
+            a["note"] = "Ritboard's server isn't running, so the page has no address right now; start `ritboard serve`."
+        else:
+            a["url"] = base_url + a["url"]
         if links and a.get("pending"):
-            a["uploads"] = upload_out(ws, reg.get(ws).upload_links(a["id"]))
+            a["uploads"] = upload_out(st.id, st.upload_links(a["id"]))
         return a
 
     def fill_locals(st, aid: str, items: list[tuple[str, str]]) -> list[dict[str, Any]]:
@@ -173,6 +182,12 @@ def build_mcp(
         return done
 
     def upload_out(ws: str, links: dict[str, Any]) -> dict[str, Any]:
+        if offline:
+            return {
+                "waiting": [{"path": f["path"], "size": f["size"], "sha256": f["sha256"]} for f in links["pending"]],
+                "how": "Ritboard's server isn't running, so there are no upload links. Save each file on this computer "
+                       "and call fill_from_local_files, or copy it into the artifact's folder yourself.",
+            }
         files, seen = [], set()
         for f in links["pending"]:
             url = f"{base_url}/w/{ws}/u/{links['token']}/{f['sha256']}"
@@ -194,18 +209,16 @@ def build_mcp(
     def _overview(ws: str) -> dict[str, Any]:
         st = reg.get(ws)
         placed: dict[str, list[str]] = {}
-        for p in st.placements():
-            placed.setdefault(p["finding_id"], []).append(p["board_id"])
-        boards = st.list_boards()
         counts: dict[str, int] = {}
         for p in st.placements():
+            placed.setdefault(p["finding_id"], []).append(p["board_id"])
             counts[p["board_id"]] = counts.get(p["board_id"], 0) + 1
         return {
             "workspace": st.summary(),
             "settings": st.settings(),
             "boards": [
                 {"id": b["id"], "name": b["name"], "width": b["width"], "height": b["height"], "placed": counts.get(b["id"], 0)}
-                for b in boards
+                for b in st.list_boards()
             ],
             "findings": [
                 {
@@ -213,18 +226,18 @@ def build_mcp(
                     "title": f["title"],
                     "kind": f["kind"],
                     "category": f["category"],
-                    "parent_id": f["parent_id"],
                     "tags": f["tags"],
                     "on_boards": placed.get(f["id"], []),
                 }
                 for f in st.list_findings(with_content=False)
             ],
+            "problems": st.problems,
         }
 
     # ---- workspaces -----------------------------------------------------
     @tool
     async def list_workspaces() -> dict[str, Any]:
-        """List all workspaces (projects) with their ids and counts."""
+        """List all workspaces (projects): id, name, folder and counts."""
         return {"workspaces": reg.list(), "on_screen": ui_state.get("workspace")}
 
     @tool
@@ -233,9 +246,18 @@ def build_mcp(
         return {"workspace": ui_state.get("workspace"), "board_id": ui_state.get("board")}
 
     @tool
-    async def create_workspace(name: str, first_board_name: str = "Main") -> dict[str, Any]:
-        """Create a new workspace (project). It starts with one board."""
-        st = reg.create(name, first_board_name or None)
+    async def create_workspace(name: str, folder: str | None = None, first_board_name: str = "Main") -> dict[str, Any]:
+        """Create a new workspace. `folder` is an absolute path for it (must be empty or not exist);
+        without it, it goes in the default workspaces folder. It starts with one board."""
+        path = check_workspace_folder(folder, roots) if folder else None
+        st = reg.create(name, first_board_name or None, path=path)
+        return _overview(st.id)
+
+    @tool
+    async def open_workspace(folder: str, name: str | None = None) -> dict[str, Any]:
+        """Use an existing folder (e.g. a project or a git repository) as a workspace. Its files
+        become findings as they are; Ritboard adds a .ritboard folder for boards and settings."""
+        st = reg.open(check_workspace_folder(folder, roots), name)
         return _overview(st.id)
 
     @tool
@@ -266,7 +288,7 @@ def build_mcp(
 
     @tool
     async def get_overview(workspace: str) -> dict[str, Any]:
-        """Boards, categories and the full findings tree (without content) for a workspace."""
+        """Boards, categories and every finding (without content) in a workspace."""
         return _overview(workspace)
 
     # ---- findings -------------------------------------------------------
@@ -278,7 +300,7 @@ def build_mcp(
         query: str | None = None,
         include_content: bool = False,
     ) -> dict[str, Any]:
-        """List findings. Filter by category, parent (use "" for top level) or a text query."""
+        """List findings. Filter by category, folder (parent_id; "" for the top level) or a text query."""
         st = reg.get(workspace)
         fs = st.list_findings(with_content=include_content, category=category, parent_id=parent_id, query=query)
         for f in fs:
@@ -291,7 +313,7 @@ def build_mcp(
         st = reg.get(workspace)
         f = st.get_finding(finding_id)
         f.pop("rendered", None)
-        f["on_boards"] = [p for p in st.placements() if p["finding_id"] == finding_id]
+        f["on_boards"] = [p for p in st.placements() if p["finding_id"] == f["id"]]
         return f
 
     @tool
@@ -310,7 +332,8 @@ def build_mcp(
         w: int | None = None,
         h: int | None = None,
     ) -> dict[str, Any]:
-        """Add a finding to the workspace tree. Give board_id to also place it on a board
+        """Add a finding: a new file (or folder) in the workspace, named after the title.
+        parent_id is the folder to put it in. Give board_id to also place it on a board
         (x/y optional; omitted means auto-place). `source` names who posted it.
         For a page, app or chart, use publish_artifact instead; claude.ai links are refused."""
         st = reg.get(workspace)
@@ -345,8 +368,9 @@ def build_mcp(
         tags: list[str] | None = None,
         parent_id: str | None = None,
     ) -> dict[str, Any]:
-        """Change a finding. Only given fields change. category "" clears it.
-        parent_id "" moves it to the top level."""
+        """Change a finding. Only given fields change. category "" clears it. A new title renames
+        the file; parent_id moves it into that folder ("" for the top level); kind converts
+        between md, text, csv, html and url. The reply has the new id (path) if it changed."""
         st = reg.get(workspace)
         kw: dict[str, Any] = {"title": title, "content": content, "kind": kind, "tags": tags}
         if category is not None:
@@ -359,8 +383,8 @@ def build_mcp(
 
     @tool
     async def delete_finding(workspace: str, finding_id: str, recursive: bool = False) -> dict[str, Any]:
-        """Delete a finding from the workspace and every board. Children move up a level
-        unless recursive is true, in which case they are deleted too."""
+        """Delete a finding: its file or folder moves to .ritboard/local/trash and it leaves every
+        board. A folder's contents move up a level unless recursive is true."""
         return reg.get(workspace).delete_finding(finding_id, recursive)
 
     # ---- boards ---------------------------------------------------------
@@ -390,13 +414,14 @@ def build_mcp(
 
     @tool
     async def delete_board(workspace: str, board_id: str) -> dict[str, Any]:
-        """Delete a board tab. Findings stay in the workspace tree."""
+        """Delete a board tab. Findings stay in the workspace."""
         reg.get(workspace).delete_board(board_id)
         return {"deleted": board_id}
 
     @tool
     async def get_board(workspace: str, board_id: str) -> dict[str, Any]:
-        """A board with every placement (pixel geometry, title, out-of-bounds flag)."""
+        """A board with every placement (pixel geometry, title, out-of-bounds flag). Cards whose
+        file was deleted or moved where Ritboard couldn't follow are listed as missing."""
         return reg.get(workspace).board_view(board_id)
 
     @tool
@@ -409,7 +434,7 @@ def build_mcp(
 
     @tool
     async def remove_from_board(workspace: str, board_id: str, finding_ids: list[str]) -> dict[str, Any]:
-        """Take findings off a board. They stay in the workspace tree."""
+        """Take findings off a board. Their files stay."""
         return {"removed": reg.get(workspace).unplace(board_id, finding_ids)}
 
     # ---- artifacts ------------------------------------------------------
@@ -420,10 +445,8 @@ def build_mcp(
         html: str | None = None,
         files: list[ArtifactFile] | None = None,
         shadow_files: list[ShadowFile] | None = None,
-        entry: str = "index.html",
         description: str = "",
         source: str | None = None,
-        add_card: bool = True,
         parent_id: str | None = None,
         category: str | None = None,
         tags: list[str] | None = None,
@@ -433,26 +456,26 @@ def build_mcp(
         w: int | None = None,
         h: int | None = None,
     ) -> dict[str, Any]:
-        """Publish a new artifact: a page or small site kept in this workspace, version 1.
+        """Publish a new artifact: a folder named after the title, with index.html and any other files.
         Give `html` for a single page (saved as index.html), or `files` for several files.
         For big files (over ~50 KB, or binary) list them in `shadow_files` with path, sha256
         and size instead: the reply has a PUT link for each, to send with curl so the bytes
-        don't pass through this conversation.
-        By default it also adds a card for it to the tree; give board_id to place that card."""
+        don't pass through this conversation. parent_id is the folder to put it in.
+        Give board_id to place it on a board."""
         st = reg.get(workspace)
         shadows = {s.path: s.model_dump() for s in shadow_files or []}
-        a = st.create_artifact(title, _decode(files, html), entry, description, source, shadows=shadows)
+        a = st.create_artifact(
+            title, _decode(files, html), description=description, source=source, shadows=shadows,
+            parent_id=parent_id, category=category, tags=tags,
+        )
         local = fill_locals(st, a["id"], [(s.sha256, s.local_path) for s in shadow_files or [] if s.local_path])
         if local:
             a = st.get_artifact(a["id"])
-        out: dict[str, Any] = {"artifact": art_out(st.id, a)}
+        out: dict[str, Any] = {"artifact": art_out(st, a)}
         if local:
             out["local_files"] = local
-        if add_card:
-            f = st.add_finding(title, a["id"], "artifact", parent_id, category, tags, source)
-            out["finding_id"] = f["id"]
-            if board_id:
-                out["placement"] = st.place(board_id, [{"finding_id": f["id"], "x": x, "y": y, "w": w, "h": h}])[0]
+        if board_id:
+            out["placement"] = st.place(board_id, [{"finding_id": a["id"], "x": x, "y": y, "w": w, "h": h}])[0]
         return out
 
     @tool
@@ -463,45 +486,38 @@ def build_mcp(
         files: list[ArtifactFile] | None = None,
         shadow_files: list[ShadowFile] | None = None,
         remove: list[str] | None = None,
-        note: str = "",
         title: str | None = None,
         description: str | None = None,
-        entry: str | None = None,
         source: str | None = None,
     ) -> dict[str, Any]:
-        """Make a new version of an artifact. It starts from the latest files; given files are
-        added or replaced, `remove` deletes paths. `html` replaces index.html. Every card
-        showing the artifact reloads. Title/description changes alone don't add a version.
-        `shadow_files` (path, sha256, size) register big files to send afterwards with curl;
-        the reply has their PUT links. Each publish replaces the upload links."""
+        """Change an artifact's files: given files are added or replaced, `remove` deletes paths,
+        `html` replaces index.html. Every card and page showing it reloads. A new title renames
+        its folder. `shadow_files` (path, sha256, size) register big files to send afterwards
+        with curl; the reply has their PUT links. Each change replaces the upload links."""
         st = reg.get(workspace)
         shadows = {s.path: s.model_dump() for s in shadow_files or []}
         a = st.update_artifact(
-            artifact_id, _decode(files, html), remove, note, title, description, entry, source, shadows=shadows
+            artifact_id, _decode(files, html), remove, title=title, description=description, source=source, shadows=shadows
         )
-        local = fill_locals(st, artifact_id, [(s.sha256, s.local_path) for s in shadow_files or [] if s.local_path])
+        local = fill_locals(st, a["id"], [(s.sha256, s.local_path) for s in shadow_files or [] if s.local_path])
         if local:
-            a = st.get_artifact(artifact_id)
-        out = art_out(st.id, a)
+            a = st.get_artifact(a["id"])
+        out = art_out(st, a)
         if local:
             out["local_files"] = local
         return out
 
     @tool
-    async def get_artifact(
-        workspace: str, artifact_id: str, version: int | None = None, include_content: bool = True
-    ) -> dict[str, Any]:
-        """An artifact with its version history and the files of one version (latest by
-        default). Binary files come back base64-encoded."""
+    async def get_artifact(workspace: str, artifact_id: str, include_content: bool = True) -> dict[str, Any]:
+        """An artifact and its files. Binary files come back base64-encoded."""
         st = reg.get(workspace)
-        a = st.get_artifact(artifact_id, version, include_content)
-        return {**art_out(st.id, a), "versions": a["versions"]}
+        return art_out(st, st.get_artifact(artifact_id, include_content))
 
     @tool
     async def list_artifacts(workspace: str) -> dict[str, Any]:
-        """All artifacts in a workspace: id, title, latest version, file count, size, address."""
+        """All artifacts in a workspace: id (folder path), title, file count, size, address."""
         st = reg.get(workspace)
-        return {"artifacts": [art_out(st.id, a, links=False) for a in st.list_artifacts()]}
+        return {"artifacts": [art_out(st, a, links=False) for a in st.list_artifacts()]}
 
     @tool
     async def fill_from_local_files(workspace: str, artifact_id: str, files: list[LocalFile]) -> dict[str, Any]:
@@ -510,7 +526,7 @@ def build_mcp(
         can write to a folder on it). Give each file's sha256 and its absolute path there."""
         st = reg.get(workspace)
         done = fill_locals(st, artifact_id, [(f.sha256, f.local_path) for f in files])
-        return {"local_files": done, "artifact": art_out(st.id, st.get_artifact(artifact_id))}
+        return {"local_files": done, "artifact": art_out(st, st.get_artifact(artifact_id))}
 
     @tool
     async def upload_links(workspace: str, artifact_id: str, renew: bool = False) -> dict[str, Any]:
@@ -532,7 +548,7 @@ def build_mcp(
         """Read or write an artifact's own database (what its page sees through
         window.claude.use("db")). action: collections, list, get, set (replace), update (merge;
         {"__delete__": true} removes a field) or delete. Pass if_version from a read to avoid
-        overwriting someone's change. Open pages pick up writes within a couple of seconds."""
+        overwriting someone's change. Open pages pick up writes at once."""
         st = reg.get(workspace)
         aid = artifact_id
         if action == "collections":
@@ -556,7 +572,7 @@ def build_mcp(
 
     @tool
     async def delete_artifact(workspace: str, artifact_id: str) -> dict[str, Any]:
-        """Delete an artifact with all its versions, and the cards that show it."""
+        """Delete an artifact: its folder moves to .ritboard/local/trash and it leaves every board."""
         return reg.get(workspace).delete_artifact(artifact_id)
 
     return mcp

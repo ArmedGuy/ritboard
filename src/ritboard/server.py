@@ -22,7 +22,8 @@ from starlette.types import ASGIApp, Receive, Scope, Send
 from . import __version__
 from .hub import Hub
 from .mcp_tools import build_mcp
-from .store import Conflict, NotFound, Registry, parse_artifact_ref
+from .store import Conflict, NotFound, Registry, check_workspace_folder
+from .watch import watch_workspaces
 
 STATIC = Path(__file__).parent / "static"
 ARTIFACT_PATH = re.compile(r"^/w/[^/]+/(a|u)/")  # artifact pages and upload links
@@ -46,6 +47,8 @@ class Config:
     # Folders agents may point at with local_path to fill shadow files from this computer.
     # None: the home folder when listening on localhost only, otherwise off.
     file_roots: list[Path] | None = None
+    # Where new workspaces go when no folder is given. None: ~/Ritboard.
+    workspaces_dir: Path | None = None
 
     def local_file_roots(self) -> list[Path]:
         if self.file_roots is not None:
@@ -106,6 +109,7 @@ def app_from_env():
             allowed_hosts=[h for h in os.environ.get("RITBOARD_ALLOWED_HOSTS", "").split(",") if h],
             dev=os.environ.get("RITBOARD_DEV") == "1",
             file_roots=_roots_from_env(os.environ.get("RITBOARD_FILE_ROOTS")),
+            workspaces_dir=Path(os.environ["RITBOARD_WORKSPACES"]) if os.environ.get("RITBOARD_WORKSPACES") else None,
         )
     )
 
@@ -113,6 +117,12 @@ def app_from_env():
 # ---- request bodies -------------------------------------------------------
 class WorkspaceIn(BaseModel):
     name: str
+    path: str | None = None
+
+
+class WorkspaceOpen(BaseModel):
+    path: str
+    name: str | None = None
 
 
 class WorkspacePatch(BaseModel):
@@ -151,10 +161,10 @@ _HEAD_OPEN = re.compile(rb"<head\b[^>]*>", re.I)
 _DOC_START = re.compile(rb"^\s*(<!doctype[^>]*>)?\s*(<html\b[^>]*>)?", re.I)
 
 
-def inject_runtime(html: bytes, src: str, version: int = 0, pinned: bool = False) -> bytes:
+def inject_runtime(html: bytes, src: str, stamp: int = 0) -> bytes:
     """Load the Ritboard runtime before any of the page's own scripts. It is told which
-    version it is part of, so it can reload when a newer one is published."""
-    tag = f'<script src="{src}" data-version="{version}"{" data-pinned" if pinned else ""}></script>'.encode()
+    state of the files it was served from, so it can reload when they change."""
+    tag = f'<script src="{src}" data-version="{stamp}"></script>'.encode()
     m = _HEAD_OPEN.search(html)
     if m:
         return html[: m.end()] + tag + html[m.end():]
@@ -167,10 +177,8 @@ class ArtifactCreate(BaseModel):
     title: str
     files: dict[str, str] = {}
     files_b64: dict[str, str] = {}  # binary files, base64
-    entry: str = "index.html"
     description: str = ""
     source: str | None = None
-    add_card: bool = True
     parent_id: str | None = None
     category: str | None = None
     tags: list[str] | None = None
@@ -179,11 +187,10 @@ class ArtifactCreate(BaseModel):
 
 class ArtifactUpdate(BaseModel):
     files: dict[str, str] = {}
+    files_b64: dict[str, str] = {}
     remove: list[str] | None = None
-    note: str = ""
     title: str | None = None
     description: str | None = None
-    entry: str | None = None
     source: str | None = None
 
 
@@ -279,14 +286,19 @@ class TokenGate:
 
 def create_app(cfg: Config) -> FastAPI:
     hub = Hub()
-    reg = Registry(cfg.data_dir, notify=hub.notify)
+    reg = Registry(cfg.data_dir, notify=hub.notify, default_root=cfg.workspaces_dir)
     ui_state: dict[str, Any] = {"workspace": None, "board": None}
+    roots = cfg.local_file_roots()
 
+    from .migrate import migrate_sqlite
+
+    for line in migrate_sqlite(reg):
+        print(line)
     if not reg.ids():
         reg.create("Scratch")
 
     shown_host = "127.0.0.1" if cfg.host in ("0.0.0.0", "", "::") else cfg.host
-    mcp = build_mcp(reg, ui_state, base_url=f"http://{shown_host}:{cfg.port}", file_roots=cfg.local_file_roots())
+    mcp = build_mcp(reg, ui_state, base_url=f"http://{shown_host}:{cfg.port}", file_roots=roots)
     if cfg.host in LOCAL_HOSTS and not cfg.allowed_hosts:
         security = None  # SDK default: DNS rebinding protection for localhost
     elif cfg.allowed_hosts:
@@ -308,14 +320,19 @@ def create_app(cfg: Config) -> FastAPI:
     @contextlib.asynccontextmanager
     async def lifespan(app: FastAPI):
         hub.loop = asyncio.get_running_loop()
-        watcher = asyncio.create_task(_watch_static(hub)) if cfg.dev else None
+        tasks = [asyncio.create_task(watch_workspaces(reg, hub))]
+        if cfg.dev:
+            tasks.append(asyncio.create_task(_watch_static(hub)))
         beacon = _write_beacon(cfg)
         try:
             async with mcp.session_manager.run():
                 yield
         finally:
-            if watcher:
-                watcher.cancel()
+            for t in tasks:
+                t.cancel()
+            for t in tasks:
+                with contextlib.suppress(BaseException):
+                    await t
             with contextlib.suppress(OSError):
                 beacon.unlink()
             reg.close()
@@ -333,10 +350,17 @@ def create_app(cfg: Config) -> FastAPI:
     async def _ve(request: Request, exc: ValueError):
         return JSONResponse({"detail": str(exc)}, status_code=400)
 
+    @app.exception_handler(OSError)
+    async def _os(request: Request, exc: OSError):
+        return JSONResponse({"detail": f"file system: {exc}"}, status_code=409)
+
     # ---- workspaces ---------------------------------------------------
     @app.get("/api/info")
     async def info():
-        return {"version": __version__, "data_dir": str(reg.data_dir), "mcp_path": "/mcp", "ui": ui_state}
+        return {
+            "version": __version__, "data_dir": str(reg.data_dir), "workspaces_dir": str(reg.default_root),
+            "mcp_path": "/mcp", "ui": ui_state,
+        }
 
     @app.get("/api/workspaces")
     async def list_ws():
@@ -344,7 +368,12 @@ def create_app(cfg: Config) -> FastAPI:
 
     @app.post("/api/workspaces")
     async def create_ws(body: WorkspaceIn):
-        return reg.create(body.name).summary()
+        path = check_workspace_folder(body.path, roots) if body.path else None
+        return reg.create(body.name, path=path).summary()
+
+    @app.post("/api/workspaces/open")
+    async def open_ws(body: WorkspaceOpen):
+        return reg.open(check_workspace_folder(body.path, roots), body.name).summary()
 
     @app.patch("/api/workspaces/{ws}")
     async def patch_ws(ws: str, body: WorkspacePatch):
@@ -356,8 +385,8 @@ def create_app(cfg: Config) -> FastAPI:
         return {"workspace": st.summary(), "settings": st.settings()}
 
     @app.delete("/api/workspaces/{ws}")
-    async def delete_ws(ws: str):
-        return {"trashed_to": reg.delete(ws)}
+    async def remove_ws(ws: str):
+        return {"removed": ws, "folder_kept": reg.remove(ws)}
 
     @app.post("/api/ui")
     async def report_ui(body: dict[str, Any] = Body(...)):
@@ -369,19 +398,30 @@ def create_app(cfg: Config) -> FastAPI:
     async def state(ws: str):
         return reg.get(ws).state()
 
-    # ---- findings -----------------------------------------------------
+    # ---- findings (ids are paths, so they go in the query) -------------
     @app.post("/api/w/{ws}/findings")
     async def add_finding(ws: str, body: FindingCreate):
         return reg.get(ws).add_finding(**body.model_dump())
 
-    @app.patch("/api/w/{ws}/findings/{fid}")
-    async def patch_finding(ws: str, fid: str, body: dict[str, Any] = Body(...)):
-        allowed = {"title", "content", "kind", "category", "tags", "parent_id", "sort"}
-        return reg.get(ws).update_finding(fid, **{k: v for k, v in body.items() if k in allowed})
+    @app.get("/api/w/{ws}/finding")
+    async def get_finding(ws: str, id: str):
+        return reg.get(ws).get_finding(id)
 
-    @app.delete("/api/w/{ws}/findings/{fid}")
-    async def delete_finding(ws: str, fid: str, recursive: bool = False):
-        return reg.get(ws).delete_finding(fid, recursive)
+    @app.patch("/api/w/{ws}/finding")
+    async def patch_finding(ws: str, id: str, body: dict[str, Any] = Body(...)):
+        allowed = {"title", "content", "kind", "category", "tags", "parent_id", "source"}
+        return reg.get(ws).update_finding(id, **{k: v for k, v in body.items() if k in allowed})
+
+    @app.delete("/api/w/{ws}/finding")
+    async def delete_finding(ws: str, id: str, recursive: bool = False):
+        return reg.get(ws).delete_finding(id, recursive)
+
+    @app.get("/api/w/{ws}/raw")
+    async def raw(ws: str, path: str):
+        p = reg.get(ws).raw_file(path)
+        # Same origin as the board, so nothing in it may run: an SVG opened directly could.
+        return FileResponse(p, headers={"Content-Security-Policy": "sandbox", "X-Content-Type-Options": "nosniff",
+                                        "Cache-Control": "no-cache"})
 
     # ---- boards -------------------------------------------------------
     @app.post("/api/w/{ws}/boards")
@@ -411,43 +451,46 @@ def create_app(cfg: Config) -> FastAPI:
         return {"removed": reg.get(ws).unplace(bid, finding_ids)}
 
     # ---- artifacts ----------------------------------------------------
+    def _decode(files: dict[str, str], files_b64: dict[str, str]) -> dict[str, bytes]:
+        out = {p: c.encode() for p, c in files.items()}
+        out.update({p: base64.b64decode(c) for p, c in files_b64.items()})
+        return out
+
     @app.get("/api/w/{ws}/artifacts")
     async def list_artifacts(ws: str):
         return reg.get(ws).list_artifacts()
 
-    @app.get("/api/w/{ws}/artifacts/{aid}")
-    async def get_artifact(ws: str, aid: str, version: int | None = None, content: bool = False):
-        return reg.get(ws).get_artifact(aid, version, content)
+    @app.get("/api/w/{ws}/artifact")
+    async def get_artifact(ws: str, id: str, content: bool = False):
+        return reg.get(ws).get_artifact(id, content)
 
     @app.post("/api/w/{ws}/artifacts")
     async def create_artifact(ws: str, body: ArtifactCreate):
         st = reg.get(ws)
-        files = {p: c.encode() for p, c in body.files.items()}
-        files.update({p: base64.b64decode(c) for p, c in body.files_b64.items()})
-        a = st.create_artifact(body.title, files, body.entry, body.description, body.source)
+        a = st.create_artifact(
+            body.title, _decode(body.files, body.files_b64), description=body.description, source=body.source,
+            parent_id=body.parent_id, category=body.category, tags=body.tags,
+        )
         out: dict[str, Any] = {"artifact": a}
-        if body.add_card:
-            f = st.add_finding(body.title, a["id"], "artifact", body.parent_id, body.category, body.tags, body.source)
-            out["finding"] = f
-            if body.board_id:
-                out["placement"] = st.place(body.board_id, [{"finding_id": f["id"]}])[0]
+        if body.board_id:
+            out["placement"] = st.place(body.board_id, [{"finding_id": a["id"]}])[0]
         return out
 
-    @app.post("/api/w/{ws}/artifacts/{aid}/versions")
-    async def new_version(ws: str, aid: str, body: ArtifactUpdate):
+    @app.post("/api/w/{ws}/artifact/files")
+    async def update_artifact(ws: str, id: str, body: ArtifactUpdate):
         return reg.get(ws).update_artifact(
-            aid, {p: c.encode() for p, c in body.files.items()}, body.remove, body.note,
-            body.title, body.description, body.entry, body.source,
+            id, _decode(body.files, body.files_b64), body.remove, title=body.title, description=body.description,
+            source=body.source,
         )
 
-    @app.delete("/api/w/{ws}/artifacts/{aid}")
-    async def delete_artifact(ws: str, aid: str):
-        return reg.get(ws).delete_artifact(aid)
+    @app.delete("/api/w/{ws}/artifact")
+    async def delete_artifact(ws: str, id: str):
+        return reg.get(ws).delete_artifact(id)
 
-    @app.get("/w/{ws}/a/{ref}")
-    async def artifact_root(ws: str, ref: str):
+    @app.get("/w/{ws}/a/{key}")
+    async def artifact_root(ws: str, key: str):
         # Relative links inside the artifact need the trailing slash.
-        return RedirectResponse(f"/w/{ws}/a/{ref}/", status_code=308)
+        return RedirectResponse(f"/w/{ws}/a/{key}/", status_code=308)
 
     # The artifact's own database, used by pages through window.claude.use("db").
     # Pages run with an opaque origin, so these answer cross-origin requests.
@@ -472,60 +515,74 @@ def create_app(cfg: Config) -> FastAPI:
         except ValueError as e:
             return db_json({"detail": str(e)}, 413 if "larger than" in str(e) else 400)
 
-    @app.options("/w/{ws}/a/{ref}/_db")
-    @app.options("/w/{ws}/a/{ref}/_db/doc")
-    async def db_preflight(ws: str, ref: str):
+    def art(ws: str, key: str) -> tuple[Any, str]:
+        st = reg.get(ws)
+        return st, st.artifact_by_key(key)
+
+    @app.options("/w/{ws}/a/{key}/_db")
+    @app.options("/w/{ws}/a/{key}/_db/doc")
+    async def db_preflight(ws: str, key: str):
         return Response(status_code=204, headers=DB_CORS)
 
-    @app.get("/w/{ws}/a/{ref}/_db")
-    async def db_list(ws: str, ref: str, c: str, rev: int = -1):
-        st, aid = reg.get(ws), parse_artifact_ref(ref)[0]
-
+    @app.get("/w/{ws}/a/{key}/_db")
+    async def db_list(ws: str, key: str, c: str, rev: int = -1):
         def run():
+            st, aid = art(ws, key)
             cur = st.db_rev(aid)
             if rev == cur:
-                st.artifact_meta(aid)
                 return db_json({"rev": cur, "unchanged": True})
             return db_json({"rev": cur, "docs": st.db_list(aid, c)})
 
         return db_call(run)
 
-    @app.get("/w/{ws}/a/{ref}/_db/doc")
-    async def db_get(ws: str, ref: str, c: str, id: str):
-        st, aid = reg.get(ws), parse_artifact_ref(ref)[0]
-        return db_call(lambda: db_json(st.db_get(aid, c, id)))
-
-    @app.put("/w/{ws}/a/{ref}/_db/doc")
-    async def db_set(ws: str, ref: str, c: str, id: str, body: Any = Body(...)):
-        st, aid = reg.get(ws), parse_artifact_ref(ref)[0]
-        return db_call(lambda: db_json(st.db_write(aid, c, id, body)))
-
-    @app.patch("/w/{ws}/a/{ref}/_db/doc")
-    async def db_update(ws: str, ref: str, c: str, id: str, body: Any = Body(...)):
-        st, aid = reg.get(ws), parse_artifact_ref(ref)[0]
-        return db_call(lambda: db_json(st.db_write(aid, c, id, body, merge=True)))
-
-    @app.delete("/w/{ws}/a/{ref}/_db/doc")
-    async def db_delete(ws: str, ref: str, c: str, id: str):
-        st, aid = reg.get(ws), parse_artifact_ref(ref)[0]
-
+    @app.get("/w/{ws}/a/{key}/_db/doc")
+    async def db_get(ws: str, key: str, c: str, id: str):
         def run():
+            st, aid = art(ws, key)
+            return db_json(st.db_get(aid, c, id))
+
+        return db_call(run)
+
+    @app.put("/w/{ws}/a/{key}/_db/doc")
+    async def db_set(ws: str, key: str, c: str, id: str, body: Any = Body(...)):
+        def run():
+            st, aid = art(ws, key)
+            return db_json(st.db_write(aid, c, id, body))
+
+        return db_call(run)
+
+    @app.patch("/w/{ws}/a/{key}/_db/doc")
+    async def db_update(ws: str, key: str, c: str, id: str, body: Any = Body(...)):
+        def run():
+            st, aid = art(ws, key)
+            return db_json(st.db_write(aid, c, id, body, merge=True))
+
+        return db_call(run)
+
+    @app.delete("/w/{ws}/a/{key}/_db/doc")
+    async def db_delete(ws: str, key: str, c: str, id: str):
+        def run():
+            st, aid = art(ws, key)
             st.db_delete(aid, c, id)
             return Response(status_code=204, headers=DB_CORS)
 
         return db_call(run)
 
-    @app.get("/w/{ws}/a/{ref}/_events")
-    async def artifact_events(ws: str, ref: str, request: Request):
+    @app.get("/w/{ws}/a/{key}/_events")
+    async def artifact_events(ws: str, key: str, request: Request):
         """Server-sent events for an open artifact page: version, db, deleted."""
-        st = reg.get(ws)
-        aid = parse_artifact_ref(ref)[0]
-        a = st.artifact_meta(aid)
+        st, aid = art(ws, key)
         q = hub.watch_artifact(st.id, aid)
+
+        def stamp() -> int | None:
+            try:
+                return reg.get(ws).stamp(aid)
+            except (NotFound, ValueError):
+                return None
 
         async def stream():
             try:
-                hello = json.dumps({"latest": a["latest"], "rev": st.db_rev(aid)})
+                hello = json.dumps({"latest": stamp(), "rev": st.db_rev(aid)})
                 yield f"event: hello\ndata: {hello}\n\n"
                 while True:
                     try:
@@ -535,10 +592,9 @@ def create_app(cfg: Config) -> FastAPI:
                             return
                         yield ": keepalive\n\n"
                         continue
-                    try:
-                        latest = st.artifact_meta(aid)["latest"]
-                    except NotFound:
-                        latest = None
+                    latest = stamp()
+                    if latest is None:
+                        kind = "deleted"
                     yield f"event: {kind}\ndata: {json.dumps({'latest': latest})}\n\n"
                     if kind == "deleted":
                         return
@@ -551,32 +607,29 @@ def create_app(cfg: Config) -> FastAPI:
             headers={"Access-Control-Allow-Origin": "*", "Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
         )
 
-    @app.get("/w/{ws}/a/{ref}/_ritboard.js")
-    async def artifact_runtime(ws: str, ref: str):
+    @app.get("/w/{ws}/a/{key}/_ritboard.js")
+    async def artifact_runtime(ws: str, key: str):
         return Response(
             RUNTIME_JS.read_bytes(),
             media_type="text/javascript; charset=utf-8",
             headers={"Access-Control-Allow-Origin": "*", "Cache-Control": "no-cache"},
         )
 
-    def st_latest(ws: str, aid: str) -> int:
-        return reg.get(ws).artifact_meta(aid)["latest"]
-
-    @app.get("/w/{ws}/a/{ref}/{path:path}")
-    async def artifact_file(ws: str, ref: str, path: str):
-        aid, version = parse_artifact_ref(ref)
+    @app.get("/w/{ws}/a/{key}/{path:path}")
+    async def artifact_file(ws: str, key: str, path: str):
+        csp = {"Content-Security-Policy": ARTIFACT_CSP}
         try:
-            data, ctype = reg.get(ws).artifact_file(aid, version, path)
-        except NotFound as e:
-            return Response(str(e), status_code=404, media_type="text/plain", headers={"Content-Security-Policy": ARTIFACT_CSP})
+            st, aid = art(ws, key)
+            data, ctype = st.artifact_file(aid, path)
+        except (NotFound, ValueError) as e:
+            return Response(str(e), status_code=404, media_type="text/plain", headers=csp)
         if ctype.startswith("text/html"):
-            served = version or st_latest(ws, aid)
-            data = inject_runtime(data, f"/w/{ws}/a/{aid}/_ritboard.js", served, pinned=bool(version))
+            data = inject_runtime(data, f"/w/{ws}/a/{key}/_ritboard.js", st.stamp(aid))
         headers = {
-            "Content-Security-Policy": ARTIFACT_CSP,
+            **csp,
             "Access-Control-Allow-Origin": "*",  # the sandboxed page fetches its own files from an opaque origin
             "X-Content-Type-Options": "nosniff",
-            "Cache-Control": "public, max-age=31536000, immutable" if version else "no-cache",
+            "Cache-Control": "no-cache",
         }
         return Response(data, media_type=ctype, headers=headers)
 

@@ -7,7 +7,10 @@ survives server restarts.
 The tool list comes from the running server, not from the bridge's own copy of the code.
 So when Ritboard is updated and restarted, the new tools show up without restarting the
 app that launched the bridge: the bridge notices the change and tells the client the list
-changed. When the server is down, the bridge falls back to the tools it was built with.
+changed.
+
+When the server is down, the bridge runs the tools itself, straight on the workspace
+folders. Agents keep working; open boards catch up when the server starts again.
 """
 
 from __future__ import annotations
@@ -21,7 +24,10 @@ from mcp import Client, types
 from mcp.server.lowlevel import NotificationOptions, Server
 from mcp.server.stdio import stdio_server
 
+from pathlib import Path
+
 from .mcp_tools import INSTRUCTIONS, build_mcp
+from .store import Registry
 
 CHECK_EVERY_S = 10.0
 
@@ -40,12 +46,26 @@ def _fingerprint(tools: list[types.Tool]) -> str:
     return hashlib.sha256(blob.encode()).hexdigest()
 
 
-async def run_bridge(base_url: str | None, token: str | None = None, locate=None) -> None:
+async def run_bridge(
+    base_url: str | None,
+    token: str | None = None,
+    locate=None,
+    data_dir: Path | None = None,
+    workspaces_dir: Path | None = None,
+) -> None:
     """Forward to base_url, or when locate is given, ask it for (url, token) on every call
-    so a server restarted on another port is still found."""
+    so a server restarted on another port is still found. With data_dir, calls made while
+    the server is down run here, on the files."""
 
-    # Fallback when the server can't be reached: the tools this copy of the code defines.
-    local_tools = await build_mcp(None, {}).list_tools()  # type: ignore[arg-type]
+    local = {"mcp": None}
+
+    def local_mcp():
+        if local["mcp"] is None:
+            reg = Registry(data_dir, default_root=workspaces_dir) if data_dir else None
+            local["mcp"] = build_mcp(reg, {}, base_url="", file_roots=[Path.home()])  # type: ignore[arg-type]
+        return local["mcp"]
+
+    local_tools = await local_mcp().list_tools()
     state = {"listed": None, "checked": 0.0}
 
     def where() -> tuple[str, str | None]:
@@ -84,11 +104,14 @@ async def run_bridge(base_url: str | None, token: str | None = None, locate=None
             async with Client(_endpoint(w, t)) as client:
                 result = await client.call_tool(params.name, params.arguments or {})
         except Exception as e:  # server down, wrong port, token refused
-            msg = (
-                f"Could not reach Ritboard at {w} ({type(e).__name__}: {e}). "
-                "Start it with `ritboard serve`, then try again."
-            )
-            return types.CallToolResult(content=[types.TextContent(type="text", text=msg)], is_error=True)
+            if data_dir is None:
+                msg = (
+                    f"Could not reach Ritboard at {w} ({type(e).__name__}: {e}). "
+                    "Start it with `ritboard serve`, then try again."
+                )
+                return types.CallToolResult(content=[types.TextContent(type="text", text=msg)], is_error=True)
+            async with Client(local_mcp()) as client:  # work on the files directly
+                return await client.call_tool(params.name, params.arguments or {})
         await maybe_announce(ctx)
         return result
 

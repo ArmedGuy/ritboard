@@ -1204,7 +1204,9 @@ dependencies = [
     { name = "markdown-it-py" },
     { name = "mcp" },
     { name = "platformdirs" },
+    { name = "pyyaml" },
     { name = "uvicorn", extra = ["standard"] },
+    { name = "watchfiles" },
 ]
 
 [package.optional-dependencies]
@@ -1226,7 +1228,9 @@ requires-dist = [
     { name = "mcp", specifier = ">=2.3.0,<3" },
     { name = "platformdirs", specifier = ">=4.14.5" },
     { name = "pywebview", marker = "extra == 'desktop'", specifier = ">=5.4" },
+    { name = "pyyaml", specifier = ">=6.0" },
     { name = "uvicorn", extras = ["standard"], specifier = ">=0.54.0" },
+    { name = "watchfiles", specifier = ">=1.0" },
 ]
 provides-extras = ["desktop"]
 

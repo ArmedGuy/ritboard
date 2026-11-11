@@ -37,10 +37,22 @@ def default_data_dir() -> Path:
     return new
 
 
+def default_workspaces_dir() -> Path:
+    return Path(os.environ["RITBOARD_WORKSPACES"]) if os.environ.get("RITBOARD_WORKSPACES") else Path.home() / "Ritboard"
+
+
+def _data_args(p: argparse.ArgumentParser) -> None:
+    p.add_argument("--data", type=Path, default=default_data_dir(), help="settings folder (default: %(default)s)")
+    p.add_argument(
+        "--workspaces-dir", type=Path, default=default_workspaces_dir(),
+        help="where new workspaces go when no folder is given (default: %(default)s)",
+    )
+
+
 def _serve_args(p: argparse.ArgumentParser, default_host: str = "127.0.0.1", default_port: int = 8765) -> None:
     p.add_argument("--host", default=os.environ.get("RITBOARD_HOST", default_host))
     p.add_argument("--port", type=int, default=int(os.environ.get("RITBOARD_PORT", default_port)))
-    p.add_argument("--data", type=Path, default=default_data_dir(), help="data folder (default: %(default)s)")
+    _data_args(p)
     p.add_argument(
         "--token",
         default=os.environ.get("RITBOARD_TOKEN"),
@@ -76,7 +88,7 @@ def _build(args):
 
     cfg = Config(
         data_dir=args.data, host=args.host, port=args.port, token=args.token, allowed_hosts=args.allowed_hosts,
-        file_roots=_file_roots(args),
+        file_roots=_file_roots(args), workspaces_dir=args.workspaces_dir,
     )
     return cfg, create_app(cfg)
 
@@ -121,6 +133,7 @@ def cmd_serve(args) -> None:
             RITBOARD_ALLOWED_HOSTS=",".join(args.allowed_hosts),
             RITBOARD_DEV="1",
             RITBOARD_FILE_ROOTS="none" if args.no_local_files else os.pathsep.join(str(p) for p in args.file_roots or []),
+            RITBOARD_WORKSPACES=str(args.workspaces_dir),
         )
         uvicorn.run(
             "ritboard.server:app_from_env",
@@ -197,78 +210,73 @@ def cmd_app(args) -> None:
     webview.start(private_mode=False)
 
 
-def _locate(args) -> tuple[str, str | None]:
-    """The running server's address and token, from --url/--token or <data>/server.json."""
-    import json
+def _registry(args):
+    from .store import Registry
 
-    if args.url:
-        return args.url.rstrip("/"), args.token
-    try:
-        info = json.loads((args.data_dir / "server.json").read_text())
-        return info["url"], args.token or info.get("token")
-    except (OSError, ValueError, KeyError):
-        raise SystemExit(f"No running Ritboard found (no {args.data_dir / 'server.json'}). Start `ritboard serve`, or pass --url.")
+    return Registry(args.data, default_root=args.workspaces_dir)
+
+
+def cmd_open(args) -> None:
+    """Add a folder to the workspace list. Works with or without the server running."""
+    st = _registry(args).open(args.folder.expanduser().resolve(), args.name)
+    print(f"Workspace {st.name!r} ({st.id}) is {st.root}")
+
+
+def cmd_list(args) -> None:
+    for w in _registry(args).list():
+        flag = "  (folder missing)" if w.get("missing") else ""
+        print(f"{w['id']:24} {w['name']:28} {w['path']}{flag}")
+
+
+def cmd_forget(args) -> None:
+    path = _registry(args).remove(args.workspace)
+    print(f"Removed from the list. The folder stays: {path}")
+
+
+def cmd_migrate(args) -> None:
+    from .migrate import migrate_sqlite
+
+    lines = migrate_sqlite(_registry(args))
+    print("\n".join(lines) if lines else f"Nothing to convert in {args.data / 'workspaces'}.")
 
 
 def cmd_import(args) -> None:
-    """Publish a local HTML file, or a folder of files, as an artifact on the running server."""
-    import base64
+    """Copy a local HTML file, or a folder of files, into a workspace as an artifact."""
     import json
-    import urllib.error
 
-    url, token = _locate(args)
     src: Path = args.path
     if not src.exists():
         raise SystemExit(f"{src} does not exist")
     if src.is_dir():
-        paths = [p for p in sorted(src.rglob("*")) if p.is_file()]
-        rel = {p: p.relative_to(src).as_posix() for p in paths}
-        entry = args.entry or "index.html"
+        paths = [p for p in sorted(src.rglob("*")) if p.is_file() and not any(s.startswith(".") for s in p.relative_to(src).parts)]
+        files = {p.relative_to(src).as_posix(): p.read_bytes() for p in paths}
+        if args.entry and args.entry != "index.html" and "index.html" not in files:
+            files["index.html"] = files[args.entry]
     else:
-        paths, rel = [src], {src: "index.html"}
-        entry = "index.html"
-    files, files_b64 = {}, {}
-    for p in paths:
-        data = p.read_bytes()
-        try:
-            files[rel[p]] = data.decode("utf-8")
-        except UnicodeDecodeError:
-            files_b64[rel[p]] = base64.b64encode(data).decode()
+        files = {"index.html": src.read_bytes()}
     title = args.title or (src.stem if src.is_file() else src.name)
-
-    def call(method, path, body=None):
-        req = urllib.request.Request(url + path, method=method, data=None if body is None else json.dumps(body).encode())
-        req.add_header("Content-Type", "application/json")
-        if token:
-            req.add_header("Authorization", f"Bearer {token}")
-        try:
-            with urllib.request.urlopen(req, timeout=60) as r:
-                text = r.read()
-                return json.loads(text) if text else None
-        except urllib.error.HTTPError as e:
-            detail = e.read().decode(errors="replace")
-            raise SystemExit(f"{method} {path} failed ({e.code}): {detail}")
-
-    ws = args.workspace
-    out = call("POST", f"/api/w/{ws}/artifacts", {
-        "title": title, "files": files, "files_b64": files_b64, "entry": entry, "source": "import",
-        "add_card": not args.card, "board_id": args.board,
-    })
-    aid = out["artifact"]["id"]
+    st = _registry(args).get(args.workspace)
+    a = st.create_artifact(title, files, source="import", parent_id=args.folder)
+    aid = a["id"]
+    note = ""
     if args.card:
-        call("PATCH", f"/api/w/{ws}/findings/{args.card}", {"kind": "artifact", "content": aid})
+        old = st.get_finding(args.card)["id"]
+        moved = [p for p in st.placements() if p["finding_id"] == old]
+        for p in moved:
+            st.place(p["board_id"], [{"finding_id": aid, **{k: p[k] for k in ("x", "y", "w", "h", "z")}}])
+        st.delete_finding(old)
+        note = f", in place of {old} on {len(moved)} board(s)"
+    elif args.board:
+        st.place(args.board, [{"finding_id": aid}])
     n = 0
-    if args.data:
+    if args.data_file:
         # {"collection": [{"id": "...", "data": {...}}, ...], ...}
-        for coll, docs in json.loads(Path(args.data).read_text(encoding="utf-8")).items():
+        for coll, docs in json.loads(Path(args.data_file).read_text(encoding="utf-8")).items():
             for d in docs:
-                q = urllib.parse.urlencode({"c": coll, "id": d["id"]})
-                call("PUT", f"/w/{ws}/a/{aid}/_db/doc?{q}", d["data"])
+                st.db_write(aid, coll, d["id"], d["data"])
                 n += 1
-    print(f"Published {title!r} as {aid} ({len(paths)} file(s)) in {ws}"
-          + (f", card {args.card} now shows it" if args.card else "")
-          + (f", {n} database document(s) imported" if n else ""))
-    print(f"  {url}/w/{ws}/a/{aid}/")
+    print(f"Copied {title!r} to {st.root / aid} ({len(files)} file(s)){note}"
+          + (f", {n} database document(s)" if n else ""))
 
 
 def cmd_mcp(args) -> None:
@@ -287,7 +295,7 @@ def cmd_mcp(args) -> None:
         except (OSError, ValueError, KeyError):
             return f"http://127.0.0.1:{os.environ.get('RITBOARD_PORT', 8765)}", None
 
-    asyncio.run(run_bridge(url, token, locate=None if url else locate))
+    asyncio.run(run_bridge(url, token, locate=None if url else locate, data_dir=args.data, workspaces_dir=args.workspaces_dir))
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -308,31 +316,50 @@ def main(argv: list[str] | None = None) -> None:
     a.add_argument("--height", type=int, default=1000)
     a.set_defaults(func=cmd_app)
 
-    m = sub.add_parser("mcp", help="stdio MCP server that forwards to a running Ritboard (for Claude Desktop)")
+    m = sub.add_parser("mcp", help="stdio MCP server for Claude Desktop: forwards to a running Ritboard, or works on the files")
     m.add_argument(
         "--url",
         default=os.environ.get("RITBOARD_URL"),
         help="address of the running server (default: found via <data>/server.json)",
     )
     m.add_argument("--token", default=os.environ.get("RITBOARD_TOKEN"))
-    m.add_argument("--data", type=Path, default=default_data_dir(), help="data folder of the server to find")
+    _data_args(m)
     m.set_defaults(func=cmd_mcp)
 
-    i = sub.add_parser("import", help="publish a local HTML file or folder as an artifact on the running server")
+    o = sub.add_parser("open", help="use a folder as a workspace (adds it to the list)")
+    o.add_argument("folder", type=Path)
+    o.add_argument("--name")
+    _data_args(o)
+    o.set_defaults(func=cmd_open)
+
+    ls = sub.add_parser("list", help="list workspaces and their folders")
+    _data_args(ls)
+    ls.set_defaults(func=cmd_list)
+
+    fg = sub.add_parser("forget", help="remove a workspace from the list; its folder stays")
+    fg.add_argument("workspace")
+    _data_args(fg)
+    fg.set_defaults(func=cmd_forget)
+
+    mg = sub.add_parser("migrate", help="convert workspaces from older versions (SQLite) into folders")
+    _data_args(mg)
+    mg.set_defaults(func=cmd_migrate)
+
+    i = sub.add_parser("import", help="copy a local HTML file or folder into a workspace as an artifact")
     i.add_argument("path", type=Path, help="an .html file, or a folder with index.html and its other files")
     i.add_argument("--workspace", "-w", required=True)
     i.add_argument("--title")
-    i.add_argument("--entry", help="entry page inside a folder (default index.html)")
-    i.add_argument("--board", help="also place a new card on this board (id or name)")
-    i.add_argument("--card", help="turn this existing card (finding id) into the artifact card instead of adding one")
-    i.add_argument("--data", help='JSON file with database documents: {"collection": [{"id": ..., "data": {...}}]}')
-    i.add_argument("--url", default=os.environ.get("RITBOARD_URL"))
-    i.add_argument("--token", default=os.environ.get("RITBOARD_TOKEN"))
-    i.add_argument("--data-dir", dest="data_dir", type=Path, default=default_data_dir())
+    i.add_argument("--folder", help="workspace folder to put it in (a path inside the workspace)")
+    i.add_argument("--entry", help="entry page inside a folder, copied to index.html if that is missing")
+    i.add_argument("--board", help="also place it on this board (id or name)")
+    i.add_argument("--card", help="put it where this finding is on the boards, and delete that finding")
+    i.add_argument("--data", dest="data_file", help='JSON file with database documents: {"collection": [{"id": ..., "data": {...}}]}')
+    i.add_argument("--data-dir", dest="data", type=Path, default=default_data_dir())
+    i.add_argument("--workspaces-dir", type=Path, default=default_workspaces_dir())
     i.set_defaults(func=cmd_import)
 
     argv = list(sys.argv[1:] if argv is None else argv)
-    if not argv or argv[0] not in ("serve", "app", "mcp", "import", "-h", "--help"):
+    if not argv or argv[0] not in ("serve", "app", "mcp", "open", "list", "forget", "migrate", "import", "-h", "--help"):
         argv.insert(0, "serve")
     args = ap.parse_args(argv)
     args.func(args)

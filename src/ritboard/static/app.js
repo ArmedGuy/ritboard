@@ -64,6 +64,8 @@ const api = {
   del: (p) => req('DELETE', p),
 };
 const W = () => `/api/w/${encodeURIComponent(S.ws)}`;
+// Findings are files; their ids are paths inside the workspace, so they go in the query.
+const FID = (id) => `${W()}/finding?id=${encodeURIComponent(id)}`;
 
 let toastTimer;
 function toast(msg) {
@@ -98,8 +100,9 @@ const S = {
 const by = {
   finding: new Map(),
   children: new Map(),
-  artifact: new Map(),
+  missing: new Map(),    // cards whose file is gone
 };
+const TEXT_KINDS = ['md', 'text', 'csv', 'html', 'url'];
 
 function board() { return S.data?.boards.find((b) => b.id === S.boardId) || null; }
 function settings() { return S.data?.settings || { grid: 10, categories: {} }; }
@@ -111,7 +114,7 @@ function isOOB(g, b = board()) { return b && (g.x < 0 || g.y < 0 || g.x + g.w > 
 function index() {
   by.finding.clear();
   by.children.clear();
-  by.artifact = new Map((S.data.artifacts || []).map((a) => [a.id, a]));
+  by.missing.clear();
   for (const f of S.data.findings) {
     by.finding.set(f.id, f);
     const k = f.parent_id || '';
@@ -119,7 +122,19 @@ function index() {
     by.children.get(k).push(f);
   }
   S.geom.clear();
-  for (const p of S.data.placements) if (p.board_id === S.boardId) S.geom.set(p.finding_id, { x: p.x, y: p.y, w: p.w, h: p.h, z: p.z });
+  for (const p of S.data.placements) {
+    if (p.board_id !== S.boardId) continue;
+    S.geom.set(p.finding_id, { x: p.x, y: p.y, w: p.w, h: p.h, z: p.z });
+    if (p.missing) by.missing.set(p.finding_id, { id: p.finding_id, title: p.finding_id, kind: 'missing', tags: [], updated_at: '' });
+  }
+}
+function findingOrGhost(id) { return by.finding.get(id) || by.missing.get(id); }
+
+let lastProblems = '';
+function showProblems() {
+  const p = (S.data.problems || []).join(' ');
+  if (p && p !== lastProblems) toast(p);
+  lastProblems = p;
 }
 
 // ---------------------------------------------------------------- loading
@@ -156,6 +171,7 @@ async function loadState() {
       index();
       for (const id of [...S.selected]) if (!S.geom.has(id)) S.selected.delete(id);
       render();
+      showProblems();
     } finally {
       loading = null;
       if (S.pendingRefresh && !S.drag) { S.pendingRefresh = false; loadState(); }
@@ -287,8 +303,10 @@ function render() {
 function renderWsSelect() {
   const sel = $('#ws-select');
   sel.replaceChildren(
-    ...S.workspaces.map((w) => h('option', { value: w.id, selected: w.id === S.ws }, w.name)),
+    ...S.workspaces.map((w) => h('option', { value: w.id, selected: w.id === S.ws, disabled: !!w.missing, title: w.path },
+      w.missing ? `${w.name} (folder missing)` : w.name)),
     h('option', { value: '__new' }, '＋ New workspace…'),
+    h('option', { value: '__open' }, '📂 Open folder…'),
   );
   sel.value = S.ws || '';
 }
@@ -302,7 +320,7 @@ function renderTabs() {
       onclick: () => b.id !== S.boardId && selectBoard(b.id),
       ondblclick: async () => {
         const name = prompt('Board name', b.name);
-        if (name && name !== b.name) await api.patch(`${W()}/boards/${b.id}`, { name });
+        if (name && name !== b.name) await api.patch(`${W()}/boards/${encodeURIComponent(b.id)}`, { name });
       },
     }, b.name, h('small', {}, `${b.width}×${b.height}`))));
 }
@@ -324,7 +342,7 @@ function renderBoard() {
 
   const seen = new Set();
   for (const [fid, g2] of S.geom) {
-    const f = by.finding.get(fid);
+    const f = findingOrGhost(fid);
     if (!f) continue;
     seen.add(fid);
     let card = S.cardEls.get(fid);
@@ -363,17 +381,10 @@ function makeCard(fid) {
     h('div', { class: 'resize-handle' }));
 }
 
-function parseRef(ref) {
-  const [id, v] = String(ref || '').split('@');
-  return { id, version: v ? +v : null };
-}
-function artifactUrl(ref) { return `/w/${encodeURIComponent(S.ws)}/a/${ref}/`; }
+function fmtCount(n, word) { return `${n} ${word}${n === 1 ? '' : 's'}`; }
 function artifactLabel(f) {
-  const { id, version } = parseRef(f.content);
-  const a = by.artifact.get(id);
-  if (!a) return 'artifact ?';
-  const label = version ? `v${version} of ${a.latest} · pinned` : `artifact v${a.latest}`;
-  return a.pending && !version ? `${label} · ${a.pending} file${a.pending > 1 ? 's' : ''} on the way` : label;
+  const label = `artifact · ${fmtCount(f.files || 0, 'file')}`;
+  return f.pending ? `${label} · ${f.pending} on the way` : label;
 }
 
 // claude.ai links are refused when posted now; cards made before that show a note instead of a blank frame.
@@ -384,7 +395,7 @@ function refusesFraming(url) {
   } catch { return false; }
 }
 
-const KIND_LABEL = { md: 'md', text: 'txt', csv: 'table', html: 'html', url: 'web', image: 'img', folder: 'folder' };
+const KIND_LABEL = { md: 'md', text: 'txt', csv: 'table', html: 'html', url: 'web', image: 'img', folder: 'folder', file: 'file', missing: 'missing' };
 
 function updateCard(card, f, g) {
   if (!S.drag || !S.drag.ids?.includes(f.id)) {
@@ -393,21 +404,19 @@ function updateCard(card, f, g) {
   card.style.setProperty('--cat', catColor(f.category));
   card.classList.toggle('sel', S.selected.has(f.id));
   card.classList.toggle('oob', !!isOOB(g));
+  card.classList.toggle('missing', f.kind === 'missing');
   $('.title', card).textContent = f.title;
   $('.kind', card).textContent = f.kind === 'artifact' ? artifactLabel(f) : (KIND_LABEL[f.kind] || f.kind);
   $('.src', card).textContent = f.source || '';
   const open = $('a.open', card);
-  if (f.kind === 'artifact') {
-    open.hidden = !by.artifact.has(parseRef(f.content).id);
-    open.href = artifactUrl(f.content);
-  } else {
-    open.hidden = f.kind !== 'url' || !/^https?:/i.test(f.content || '');
-    if (!open.hidden) open.href = f.content;
-  }
+  const href = f.kind === 'artifact' ? f.url : (f.kind === 'image' || f.kind === 'file') ? f.src
+    : f.kind === 'url' && /^https?:/i.test(f.content || '') ? f.content : null;
+  open.hidden = !href;
+  if (href) open.href = href;
   card.title = [f.category && `Category: ${f.category}`, f.tags?.length && `Tags: ${f.tags.join(', ')}`].filter(Boolean).join('\n');
   const ver = f.kind === 'folder'
     ? f.updated_at + '|' + (by.children.get(f.id) || []).map((c) => c.id + c.title).join(',')
-    : f.updated_at + f.kind + (f.kind === 'artifact' ? '|' + (by.artifact.get(parseRef(f.content).id)?.latest ?? 'x') : '');
+    : f.updated_at + f.kind + (f.kind === 'artifact' ? '|' + f.stamp : '') + (f.src ? '|' + f.src : '');
   if (card.dataset.ver !== ver) {
     card.dataset.ver = ver;
     fillBody($('.card-body', card), f);
@@ -424,16 +433,22 @@ function fillBody(body, f) {
     body.innerHTML = f.rendered || '';
   } else if (f.kind === 'image') {
     body.classList.add('framed');
-    body.append(h('img', { src: f.content, alt: f.title, draggable: false }));
+    body.append(h('img', { src: f.src || f.content, alt: f.title, draggable: false }));
+  } else if (f.kind === 'file') {
+    body.classList.add('framed');
+    body.dataset.noframe = '1';
+    body.append(h('div', { class: 'ph noframe' }, h('div', {}, f.id), h('small', {}, fmtBytes(f.size || 0)),
+      h('a', { href: f.src, target: '_blank', rel: 'noopener noreferrer' }, 'Open ↗')));
+  } else if (f.kind === 'missing') {
+    body.classList.add('framed');
+    body.dataset.noframe = '1';
+    body.append(h('div', { class: 'ph noframe' }, h('div', {}, 'This file is gone: moved or deleted outside Ritboard.'),
+      h('small', {}, 'Select the card and press Delete to take it off the board, or put the file back.')));
   } else if (f.kind === 'folder') {
     const kids = by.children.get(f.id) || [];
     body.append(kids.length
       ? h('ul', { class: 'folder-list' }, kids.map((k) => h('li', {}, k.title)))
       : h('div', { class: 'ph' }, 'Empty folder'));
-  } else if (f.kind === 'artifact' && !by.artifact.has(parseRef(f.content).id)) {
-    body.classList.add('framed');
-    body.dataset.noframe = '1';
-    body.append(h('div', { class: 'ph' }, 'This artifact no longer exists.'));
   } else if (f.kind === 'url' && refusesFraming(f.content)) {
     body.classList.add('framed');
     body.dataset.noframe = '1';
@@ -482,7 +497,7 @@ function updateFrames() {
           ? h('iframe', { sandbox: 'allow-scripts allow-popups allow-forms allow-modals', srcdoc: wrapHtml(f.content || ''), loading: 'lazy' })
           : f.kind === 'artifact'
           ? h('iframe', {
-            src: artifactUrl(f.content), loading: 'lazy', title: f.title,
+            src: f.url, loading: 'lazy', title: f.title,
             sandbox: 'allow-scripts allow-forms allow-popups allow-popups-to-escape-sandbox allow-modals allow-downloads allow-presentation',
             allow: 'clipboard-write; fullscreen',
           })
@@ -543,7 +558,7 @@ function renderSidebar() {
     renderArtifactsTab(body, q);
   } else {
     const b = board();
-    const rows = [...S.geom.entries()].map(([id, g]) => ({ f: by.finding.get(id), g })).filter((r) => r.f && match(r.f));
+    const rows = [...S.geom.entries()].map(([id, g]) => ({ f: findingOrGhost(id), g })).filter((r) => r.f && match(r.f));
     const out = rows.filter((r) => isOOB(r.g));
     if (out.length) {
       body.append(h('div', { class: 'group-h' }, h('span', { class: 'bad' }, `Outside the board (${out.length})`),
@@ -557,7 +572,7 @@ function renderSidebar() {
   body.scrollTop = scroll;
 }
 
-const KIND_ICON = { md: 'MD', text: 'TXT', csv: 'TBL', html: 'HTM', artifact: 'APP', url: 'WEB', image: 'IMG', folder: 'DIR' };
+const KIND_ICON = { md: 'MD', text: 'TXT', csv: 'TBL', html: 'HTM', artifact: 'APP', url: 'WEB', image: 'IMG', folder: 'DIR', file: 'FILE', missing: '??' };
 
 function node(f, depth, tree, g, oob) {
   const kids = by.children.get(f.id) || [];
@@ -565,9 +580,9 @@ function node(f, depth, tree, g, oob) {
   const el = h('div', {
     class: 'node' + (S.treeSel === f.id ? ' sel' : ''), 'data-id': f.id, draggable: 'true',
     style: { paddingLeft: 6 + depth * 14 + 'px' },
-    title: [f.title, f.category && `Category: ${f.category}`, f.source && `From: ${f.source}`].filter(Boolean).join('\n'),
+    title: [f.title, f.id !== f.title && f.id, f.category && `Category: ${f.category}`, f.source && `From: ${f.source}`].filter(Boolean).join('\n'),
     onclick: () => treeClick(f.id),
-    ondblclick: () => openEditor(f.id),
+    ondblclick: () => { if (f.kind !== 'missing') openEditor(f.id); },
     ondragstart: (e) => {
       e.dataTransfer.setData('application/x-ritboard-finding', f.id);
       e.dataTransfer.setData('text/plain', f.title);
@@ -591,7 +606,7 @@ function node(f, depth, tree, g, oob) {
   f.category ? h('span', { class: 'cd', style: { background: catColor(f.category) } }) : null,
   !g ? h('span', { class: 'ob', title: placed ? 'On this board' : '' }, placed ? '✓' : '') : null);
 
-  if (tree) {
+  if (tree && f.kind === 'folder') {
     el.addEventListener('dragover', (e) => {
       if (!e.dataTransfer.types.includes('application/x-ritboard-finding')) return;
       e.preventDefault(); e.stopPropagation();
@@ -604,7 +619,7 @@ function node(f, depth, tree, g, oob) {
       const id = e.dataTransfer.getData('application/x-ritboard-finding');
       if (!id || id === f.id) return;
       S.expanded.add(f.id); LS.set('expanded', [...S.expanded]);
-      await api.patch(`${W()}/findings/${id}`, { parent_id: f.id });
+      await api.patch(FID(id), { parent_id: f.id });
     });
   }
   return el;
@@ -629,7 +644,7 @@ async function pullIn(ids) {
     const w = Math.min(g.w, b.width), hgt = Math.min(g.h, b.height);
     return { finding_id: id, x: Math.max(0, Math.min(g.x, b.width - w)), y: Math.max(0, Math.min(g.y, b.height - hgt)), w, h: hgt };
   });
-  await api.put(`${W()}/boards/${S.boardId}/placements`, items);
+  await api.put(`${W()}/boards/${encodeURIComponent(S.boardId)}/placements`, items);
 }
 
 function renderBoardSelection() {
@@ -664,7 +679,7 @@ function bringToFront(ids) {
 
 async function savePlacements(ids) {
   const items = ids.filter((id) => S.geom.has(id)).map((id) => ({ finding_id: id, ...S.geom.get(id) }));
-  if (items.length) await api.put(`${W()}/boards/${S.boardId}/placements`, items);
+  if (items.length) await api.put(`${W()}/boards/${encodeURIComponent(S.boardId)}/placements`, items);
 }
 
 function onPointerDown(e) {
@@ -808,14 +823,12 @@ function onWheel(e) {
 }
 
 async function onDrop(e) {
-  const aid = e.dataTransfer.getData('application/x-ritboard-artifact');
-  let id = e.dataTransfer.getData('application/x-ritboard-finding');
-  if ((!id && !aid) || !board()) return;
+  const id = e.dataTransfer.getData('application/x-ritboard-finding');
+  if (!id || !board()) return;
   e.preventDefault();
-  if (aid) id = (await cardForArtifact(aid)).id;
   const pt = toBoard(e.clientX, e.clientY);
   const item = { finding_id: id, x: snap(pt.x - 20), y: snap(pt.y - 15) };
-  api.put(`${W()}/boards/${S.boardId}/placements`, [item]).then(() => { S.selected = new Set([id]); });
+  api.put(`${W()}/boards/${encodeURIComponent(S.boardId)}/placements`, [item]).then(() => { S.selected = new Set([id]); });
 }
 
 let nudgeTimer;
@@ -843,7 +856,7 @@ function onKey(e) {
   const step = e.shiftKey ? (settings().grid || 10) : 1;
   switch (e.key) {
     case 'Delete': case 'Backspace':
-      if (S.selected.size) api.post(`${W()}/boards/${S.boardId}/unplace`, [...S.selected]);
+      if (S.selected.size) api.post(`${W()}/boards/${encodeURIComponent(S.boardId)}/unplace`, [...S.selected]);
       e.preventDefault(); break;
     case 'ArrowLeft': if (S.selected.size) { nudge(-step, 0); e.preventDefault(); } break;
     case 'ArrowRight': if (S.selected.size) { nudge(step, 0); e.preventDefault(); } break;
@@ -866,40 +879,36 @@ function toggleSidebar() { document.body.classList.toggle('side-off'); LS.set('s
 function toggleChrome() { document.body.classList.toggle('chrome-off'); LS.set('chromeOff', document.body.classList.contains('chrome-off')); }
 
 // ---------------------------------------------------------------- editor
-function cardsFor(aid) {
-  return S.data.findings.filter((f) => f.kind === 'artifact' && parseRef(f.content).id === aid);
-}
-
 function renderArtifactsTab(body, q) {
-  const arts = (S.data.artifacts || []).filter((a) => !q || a.title.toLowerCase().includes(q));
+  const arts = (S.data.artifacts || []).filter((a) => !q || a.title.toLowerCase().includes(q) || a.id.toLowerCase().includes(q));
   if (!arts.length) {
     body.append(h('div', { class: 'empty' }, q ? 'Nothing matches.'
-      : 'No artifacts yet. Agents publish them with publish_artifact, or make one with ＋ Finding and kind Artifact.'));
+      : 'No artifacts yet. An artifact is a folder with index.html. Agents publish them with publish_artifact, or make one with ＋ Finding and kind Artifact.'));
     return;
   }
   for (const a of arts) {
-    const cards = cardsFor(a.id);
-    const onBoard = cards.some((c) => S.geom.has(c.id));
+    const onBoard = S.geom.has(a.id);
     body.append(h('div', {
-      class: 'node art', draggable: 'true', title: `${a.title}\n${a.files} files · ${fmtBytes(a.bytes)} · updated ${new Date(a.updated_at).toLocaleString()}\nDrag onto the board to show it.`,
+      class: 'node art', draggable: 'true',
+      title: `${a.title}\n${a.id}/\n${fmtCount(a.files, 'file')} · ${fmtBytes(a.bytes)} · updated ${new Date(a.updated_at).toLocaleString()}\nDrag onto the board to show it.`,
       ondragstart: (e) => {
-        e.dataTransfer.setData('application/x-ritboard-artifact', a.id);
+        e.dataTransfer.setData('application/x-ritboard-finding', a.id);
         e.dataTransfer.setData('text/plain', a.title);
       },
-      onclick: () => { if (cards[0]) treeClick(cards[0].id); },
-      ondblclick: async () => openEditor(cards[0] ? cards[0].id : (await cardForArtifact(a.id)).id),
+      onclick: () => treeClick(a.id),
+      ondblclick: () => openEditor(a.id),
     },
     h('span', { class: 'ki' }, 'APP'),
     h('span', { class: 'tt' }, a.title),
-    h('span', { class: 'xy' }, `v${a.latest}`),
+    h('span', { class: 'xy' }, fmtCount(a.files, 'file')),
     onBoard ? h('span', { class: 'ob', title: 'On this board' }, '✓') : h('span', { class: 'ob' }),
-    h('a', { class: 'mini-link', href: artifactUrl(a.id), target: '_blank', rel: 'noopener', title: 'Open in a new window', onclick: (e) => e.stopPropagation() }, '↗'),
+    h('a', { class: 'mini-link', href: a.url, target: '_blank', rel: 'noopener', title: 'Open in a new window', onclick: (e) => e.stopPropagation() }, '↗'),
     h('button', {
-      class: 'mini', title: 'Delete the artifact, all its versions and its cards',
+      class: 'mini', title: 'Move the artifact folder to the trash',
       onclick: async (e) => {
         e.stopPropagation();
-        if (!confirm(`Delete artifact “${a.title}” with all ${a.latest} version(s)${cards.length ? ` and its ${cards.length} card(s)` : ''}?`)) return;
-        await api.del(`${W()}/artifacts/${a.id}`);
+        if (!confirm(`Delete artifact “${a.title}”? Its folder moves to .ritboard/local/trash and it leaves every board.`)) return;
+        await api.del(FID(a.id) + '&recursive=true');
       },
     }, '✕')));
   }
@@ -907,23 +916,16 @@ function renderArtifactsTab(body, q) {
 
 function fmtBytes(n) { return n < 1024 ? `${n} B` : n < 1048576 ? `${(n / 1024).toFixed(1)} KB` : `${(n / 1048576).toFixed(1)} MB`; }
 
-// The tree card for an artifact, created if it has none yet.
-async function cardForArtifact(aid) {
-  const existing = cardsFor(aid)[0];
-  if (existing) return existing;
-  const a = by.artifact.get(aid);
-  return api.post(`${W()}/findings`, { title: a?.title || 'Artifact', kind: 'artifact', content: aid, source: 'you' });
-}
-
 const HINTS = {
   md: 'Markdown. Tables, lists and code blocks work. Raw HTML is shown as text.',
   text: 'Shown as-is in a monospace block.',
   csv: 'First row is the header. Comma, semicolon, tab or | separated.',
-  html: 'A one-off HTML snippet or document, stored in the card. Runs sandboxed with scripts allowed. For anything you will revise, use Artifact.',
-  artifact: 'A page kept as an artifact: every save is a new version, it has its own address (↗), and every card showing it reloads. Scripts run sandboxed.',
-  url: 'An external page to frame. Many sites refuse framing. claude.ai links are not accepted; make an Artifact with the HTML instead.',
-  image: 'An image URL or a data: URI.',
-  folder: 'Groups findings in the tree. Placed on a board it lists its children.',
+  html: 'A one-off HTML snippet or document, saved as an .html file. Runs sandboxed with scripts allowed. For a page with its own files, use Artifact.',
+  artifact: 'A folder with index.html and any other files the page uses. It has its own address (↗), and every card showing it reloads when its files change. Scripts run sandboxed.',
+  url: 'An external page to frame, saved as a .url shortcut. Many sites refuse framing. claude.ai links are not accepted; make an Artifact with the HTML instead.',
+  image: 'An image URL (https://) or a data: URI. Image files in the workspace folder show up by themselves.',
+  folder: 'A folder in the workspace. Placed on a board it lists what is in it.',
+  file: 'A file Ritboard has no viewer for. Open it with ↗.',
 };
 
 function openEditor(id, parentId) {
@@ -934,21 +936,23 @@ function openEditor(id, parentId) {
   $('#editor').hidden = false;
   $('#ed-heading').textContent = f ? 'Finding' : 'New finding';
   form.title.value = f?.title || '';
-  form.kind.value = f?.kind || (parentId === 'folder' ? 'folder' : 'md');
+  form.kind.value = f ? (f.kind === 'file' ? 'text' : f.kind) : (parentId === 'folder' ? 'folder' : 'md');
   form.category.value = f?.category || '';
   form.tags.value = (f?.tags || []).join(', ');
   form.content.value = f?.kind === 'artifact' ? '' : (f?.content || '');
   form.dataset.parent = f ? '' : (parentId && parentId !== 'folder' ? parentId : '');
-  // An artifact card's kind is fixed, and an existing card can't turn into an artifact card.
-  form.kind.disabled = f?.kind === 'artifact';
-  form.kind.querySelector('option[value=artifact]').disabled = !!f && f.kind !== 'artifact';
+  // Only text files convert into each other (the extension changes).
+  form.kind.disabled = !!f && !TEXT_KINDS.includes(f.kind);
+  for (const o of form.kind.options) o.disabled = !!f && TEXT_KINDS.includes(f.kind) && !TEXT_KINDS.includes(o.value);
+  form.content.readOnly = false;
+  form.dataset.nocontent = f && (['folder', 'file', 'artifact'].includes(f.kind) || (f.kind === 'image' && !f.content)) ? '1' : '';
   delete form.dataset.artifact;
   $('#ed-art').textContent = '';
   if (f?.kind === 'artifact') loadArtifactIntoEditor(f);
   $('#ed-place-wrap').hidden = !!f;
   $('#ed-delete').hidden = !f;
   $('#ed-toggle-place').hidden = !f;
-  $('#ed-meta').textContent = f ? `${f.id}${f.source ? ' · from ' + f.source : ''} · updated ${new Date(f.updated_at).toLocaleString()}` : '';
+  $('#ed-meta').textContent = f ? `${f.id}${f.kind === 'folder' || f.kind === 'artifact' ? '/' : ''}${f.source ? ' · from ' + f.source : ''} · changed ${new Date(f.updated_at).toLocaleString()}` : '';
   $('#cat-list').replaceChildren(...Object.keys(settings().categories).map((c) => h('option', { value: c })));
   kindChanged();
   refreshEditorPlaceButton();
@@ -956,25 +960,20 @@ function openEditor(id, parentId) {
 }
 async function loadArtifactIntoEditor(f) {
   const form = $('#ed-form');
-  const { id } = parseRef(f.content);
   form.content.value = 'Loading…';
   form.content.readOnly = true;
   try {
-    const a = await api.get(`${W()}/artifacts/${id}`);
-    const res = await fetch(`/w/${encodeURIComponent(S.ws)}/a/${id}/${a.entry}`, { credentials: 'same-origin' });
-    const text = await res.text();
+    const a = await api.get(`${W()}/artifact?id=${encodeURIComponent(f.id)}&content=true`);
     if (S.editing !== f.id) return;
-    form.content.value = text;
-    form.dataset.artifact = id;
-    form.dataset.entry = a.entry;
-    form.dataset.orig = text;
-    const others = a.files.map((x) => x.path).filter((p) => p !== a.entry);
-    const pinned = parseRef(f.content).version;
+    const page = a.files.find((x) => x.path === 'index.html');
+    form.content.value = page?.content || '';
+    form.dataset.artifact = f.id;
+    form.dataset.orig = form.content.value;
+    const others = a.files.map((x) => x.path).filter((p) => p !== 'index.html');
     $('#ed-art').replaceChildren(...[
-      h('span', {}, `Editing ${a.entry} of version ${a.latest}. Saving makes version ${a.latest + 1}.`),
-      others.length ? h('span', {}, ` Other files: ${others.join(', ')} (change those over MCP).`) : null,
-      pinned ? h('span', {}, ` This card is pinned to version ${pinned}.`) : null,
-      ' ', h('a', { href: artifactUrl(id), target: '_blank', rel: 'noopener' }, 'Open ↗'),
+      h('span', {}, `Editing index.html in ${f.id}/.`),
+      others.length ? h('span', {}, ` Other files: ${others.join(', ')}.`) : null,
+      ' ', h('a', { href: f.url, target: '_blank', rel: 'noopener' }, 'Open ↗'),
     ].filter(Boolean));
   } catch {
     form.content.value = '';
@@ -988,7 +987,7 @@ function kindChanged() {
   const k = $('#ed-form').kind.value;
   $('#ed-hint').textContent = HINTS[k] || '';
   $('#ed-content-label').firstChild.textContent = k === 'url' ? 'URL ' : k === 'image' ? 'Image URL ' : k === 'artifact' ? 'Page HTML ' : 'Content ';
-  $('#ed-content-label').hidden = k === 'folder';
+  $('#ed-content-label').hidden = k === 'folder' || !!$('#ed-form').dataset.nocontent && k !== 'artifact';
 }
 function refreshEditorPlaceButton() {
   const id = S.editing;
@@ -1009,13 +1008,29 @@ async function saveEditor(e) {
   if (body.kind === 'artifact') return saveArtifact(form, body);
   if (S.editing === 'new') {
     const f = await api.post(`${W()}/findings`, { ...body, parent_id: form.dataset.parent || null, source: 'you' });
-    if (form.place.checked && board()) await api.put(`${W()}/boards/${S.boardId}/placements`, [{ finding_id: f.id }]);
+    if (form.place.checked && board()) await api.put(`${W()}/boards/${encodeURIComponent(S.boardId)}/placements`, [{ finding_id: f.id }]);
     S.treeSel = f.id;
     if (f.parent_id) { S.expanded.add(f.parent_id); LS.set('expanded', [...S.expanded]); }
+    await loadState();
     openEditor(f.id);
   } else {
-    await api.patch(`${W()}/findings/${S.editing}`, body);
+    const cur = by.finding.get(S.editing);
+    if (form.dataset.nocontent || cur?.kind === 'folder') delete body.content;
+    if (cur && TEXT_KINDS.includes(cur.kind) === false) delete body.kind;
+    const f = await api.patch(FID(S.editing), body);
+    await followRename(S.editing, f.id);
   }
+}
+
+// A save can rename the file (new title) and so change the finding's id.
+async function followRename(oldId, newId) {
+  if (oldId === newId) return;
+  for (const set of [S.selected, S.expanded]) if (set.has(oldId)) { set.delete(oldId); set.add(newId); }
+  LS.set('expanded', [...S.expanded]);
+  if (S.treeSel === oldId) S.treeSel = newId;
+  S.editing = newId;
+  await loadState();
+  openEditor(newId);
 }
 
 async function saveArtifact(form, body) {
@@ -1025,20 +1040,20 @@ async function saveArtifact(form, body) {
       category: body.category, tags: body.tags, source: 'you',
       board_id: form.place.checked && board() ? S.boardId : null,
     });
-    S.treeSel = out.finding.id;
+    S.treeSel = out.artifact.id;
     await loadState();
-    openEditor(out.finding.id);
+    openEditor(out.artifact.id);
     return;
   }
-  await api.patch(`${W()}/findings/${S.editing}`, { title: body.title, category: body.category, tags: body.tags });
-  const id = form.dataset.artifact;
-  if (id && body.content !== form.dataset.orig) {
-    await api.post(`${W()}/artifacts/${id}/versions`, { files: { [form.dataset.entry]: body.content }, note: 'edited in Ritboard', source: 'you' });
+  const id = S.editing;
+  if (form.dataset.artifact === id && body.content !== form.dataset.orig) {
+    await api.post(`${W()}/artifact/files?id=${encodeURIComponent(id)}`, { files: { 'index.html': body.content }, source: 'you' });
     form.dataset.orig = body.content;
-    await loadState();
-    const f = by.finding.get(S.editing);
-    if (f) loadArtifactIntoEditor(f);
   }
+  const f = await api.patch(FID(id), { title: body.title, category: body.category, tags: body.tags });
+  if (f.id !== id) return followRename(id, f.id);
+  await loadState();
+  if (by.finding.get(id)) loadArtifactIntoEditor(by.finding.get(id));
 }
 
 // ---------------------------------------------------------------- settings
@@ -1075,6 +1090,7 @@ async function openSettings() {
   const mcp = `${location.origin}/mcp`;
   $('#set-mcp').textContent = mcp;
   $('#set-cc').textContent = `claude mcp add --transport http ritboard ${mcp}`;
+  $('#set-folder').textContent = ws?.path || '';
   try { $('#set-data').textContent = (await api.get('/api/info')).data_dir; } catch { /* offline */ }
   d.showModal();
 }
@@ -1083,14 +1099,14 @@ function wireSettings() {
   const f = $('#set-form');
   $('#set-board-apply').onclick = async () => {
     const b = board(); if (!b) return;
-    await api.patch(`${W()}/boards/${b.id}`, { name: f.b_name.value.trim() || b.name, width: +f.b_w.value, height: +f.b_h.value, background: f.b_bg.value === themeMat() ? (b.background || null) : f.b_bg.value });
+    await api.patch(`${W()}/boards/${encodeURIComponent(b.id)}`, { name: f.b_name.value.trim() || b.name, width: +f.b_w.value, height: +f.b_h.value, background: f.b_bg.value === themeMat() ? (b.background || null) : f.b_bg.value });
     $('#settings').close();
   };
   $('#set-board-delete').onclick = async () => {
     const b = board(); if (!b) return;
     if (S.data.boards.length <= 1) return toast('A workspace keeps at least one board.');
     if (!confirm(`Delete board “${b.name}”? Findings stay in the workspace.`)) return;
-    await api.del(`${W()}/boards/${b.id}`);
+    await api.del(`${W()}/boards/${encodeURIComponent(b.id)}`);
     $('#settings').close();
   };
   $('#set-ws-apply').onclick = async () => {
@@ -1103,8 +1119,8 @@ function wireSettings() {
     $('#settings').close();
   };
   $('#set-ws-delete').onclick = async () => {
-    const name = S.data?.workspace.name;
-    if (prompt(`Type the workspace name to delete it. The file moves to the trash folder.\n\n${name}`) !== name) return;
+    const w = S.data?.workspace;
+    if (!confirm(`Remove “${w.name}” from Ritboard's list?\n\nThe folder and its files stay where they are:\n${w.path}\n\nOpen it again any time with “Open folder…”.`)) return;
     await api.del(`/api/workspaces/${encodeURIComponent(S.ws)}`);
     $('#settings').close();
     await loadWorkspaces();
@@ -1134,7 +1150,7 @@ function wire() {
   vp.addEventListener('wheel', onWheel, { passive: false });
   vp.addEventListener('dragover', (e) => {
     const t = e.dataTransfer.types;
-    if (t.includes('application/x-ritboard-finding') || t.includes('application/x-ritboard-artifact')) { e.preventDefault(); e.dataTransfer.dropEffect = 'copy'; }
+    if (t.includes('application/x-ritboard-finding')) { e.preventDefault(); e.dataTransfer.dropEffect = 'copy'; }
   });
   vp.addEventListener('drop', onDrop);
   vp.addEventListener('click', (e) => {
@@ -1174,13 +1190,18 @@ function wire() {
   };
   $('#ws-select').onchange = async (e) => {
     const v = e.target.value;
-    if (v === '__new') {
-      const name = prompt('New workspace name');
-      if (!name) { e.target.value = S.ws; return; }
-      const w = await api.post('/api/workspaces', { name });
-      await loadWorkspaces();
-      await selectWorkspace(w.id);
-      renderWsSelect();
+    if (v === '__new' || v === '__open') {
+      const answer = v === '__new'
+        ? prompt('New workspace name. Its folder goes in your Ritboard folder.')
+        : prompt('Folder to use as a workspace (full path on the computer running Ritboard). Its files stay as they are; Ritboard adds a .ritboard folder.');
+      if (!answer) { e.target.value = S.ws; return; }
+      try {
+        const w = v === '__new'
+          ? await api.post('/api/workspaces', { name: answer })
+          : await api.post('/api/workspaces/open', { path: answer.trim().replace(/^"(.*)"$/, '$1') });
+        await loadWorkspaces();
+        await selectWorkspace(w.id);
+      } finally { renderWsSelect(); }
     } else await selectWorkspace(v);
   };
   $$('.side-tabs button').forEach((b) => (b.onclick = () => { S.sideTab = b.dataset.tab; LS.set('sideTab', S.sideTab); renderSidebar(); }));
@@ -1193,7 +1214,7 @@ function wire() {
     const id = e.dataTransfer.getData('application/x-ritboard-finding');
     if (!id || S.sideTab !== 'tree') return;
     e.preventDefault();
-    if (by.finding.get(id)?.parent_id) await api.patch(`${W()}/findings/${id}`, { parent_id: null });
+    if (by.finding.get(id)?.parent_id) await api.patch(FID(id), { parent_id: null });
   });
   const parentForNew = () => { const t = by.finding.get(S.treeSel); return t ? (t.kind === 'folder' ? t.id : t.parent_id) : null; };
   $('#btn-new-finding').onclick = () => openEditor('new', parentForNew());
@@ -1209,15 +1230,15 @@ function wire() {
   $('#ed-toggle-place').onclick = async () => {
     const id = S.editing;
     if (!id || !board()) return;
-    if (S.geom.has(id)) await api.post(`${W()}/boards/${S.boardId}/unplace`, [id]);
-    else await api.put(`${W()}/boards/${S.boardId}/placements`, [{ finding_id: id }]);
+    if (S.geom.has(id)) await api.post(`${W()}/boards/${encodeURIComponent(S.boardId)}/unplace`, [id]);
+    else await api.put(`${W()}/boards/${encodeURIComponent(S.boardId)}/placements`, [{ finding_id: id }]);
   };
   $('#ed-delete').onclick = async () => {
     const f = by.finding.get(S.editing);
     if (!f) return;
     const kids = (by.children.get(f.id) || []).length;
-    if (!confirm(`Delete “${f.title}” from the workspace and every board?${kids ? `\nIts ${kids} children move up a level.` : ''}`)) return;
-    await api.del(`${W()}/findings/${f.id}`);
+    if (!confirm(`Delete “${f.title}”? The ${f.kind === 'folder' ? 'folder' : 'file'} moves to .ritboard/local/trash and leaves every board.${kids ? `\nWhat is in it moves up a level.` : ''}`)) return;
+    await api.del(FID(f.id) + (f.kind === 'artifact' ? '&recursive=true' : ''));
     closeEditor();
   };
   wireSettings();

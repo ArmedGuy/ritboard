@@ -1,26 +1,46 @@
-"""Storage: one SQLite file per workspace.
+"""Storage: a workspace is a folder of ordinary files.
 
-A finding exists in the workspace tree whether or not it is on a board.
-A placement puts a finding on one board at exact pixel coordinates.
+    my-workspace/                   any folder, can be a git repository
+      .ritboard/
+        workspace.yaml              name, defaults, category colours
+        boards/<id>.yaml            board size and placements (path -> [x, y, w, h, z])
+        meta.yaml                   metadata for files that can't hold their own
+        .gitignore                  ignores local/
+        local/                      this computer only: upload links, rename index, trash
+      Notes/                        folders are the tree
+        idea.md                     a finding; title, category, tags in front matter
+        rows.csv
+      Report/                       a folder with index.html is an artifact
+        index.html
+        .data/<collection>.json     the artifact's database
+
+Findings are identified by their path inside the workspace, e.g. "Notes/idea.md". Boards
+point at those paths. When Ritboard renames or moves a file it updates the boards; when
+something else does, it recognises the file by its content and does the same.
 """
 
 from __future__ import annotations
 
 import base64
+import copy
 import hashlib
+import hmac
 import json
 import mimetypes
+import os
 import re
 import secrets
 import shutil
-import sqlite3
 import threading
 import time
+import urllib.parse
 from collections.abc import Callable
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from . import files as F
 from .render import normalize_kind, render
 
 Notify = Callable[[str, str], None]
@@ -41,98 +61,19 @@ DEFAULT_SIZES = {
     "image": (400, 300),
     "folder": (300, 220),
     "artifact": (800, 600),
+    "file": (300, 160),
 }
 
-ARTIFACT_MAX_BYTES = 64 * 1024 * 1024  # per version, all files together
+ARTIFACT_MAX_BYTES = 64 * 1024 * 1024  # one artifact, all files together
 UPLOAD_TTL_SECONDS = 4 * 3600  # how long upload links work after a publish
 DOC_MAX_BYTES = 1024 * 1024  # one artifact database document
+MAX_ENTRIES = 5000  # files and folders shown per workspace
+MAX_SHOWN_BYTES = 2 * 1024 * 1024  # bigger text files are listed but not shown in cards
+SCAN_EVERY_S = 0.5
 _SEGMENT = re.compile(r"^[A-Za-z0-9_\-.~:@+]{1,200}$")
+TEXT_KINDS = ("md", "text", "csv", "html", "url")
 
 PALETTE = ["#d1495b", "#edae49", "#00798c", "#30638e", "#6a994e", "#8d6a9f", "#c97b63", "#4f6d7a"]
-
-SCHEMA = """
-CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
-CREATE TABLE IF NOT EXISTS findings (
-    id TEXT PRIMARY KEY,
-    parent_id TEXT REFERENCES findings(id) ON DELETE CASCADE,
-    title TEXT NOT NULL,
-    kind TEXT NOT NULL DEFAULT 'md',
-    content TEXT NOT NULL DEFAULT '',
-    rendered TEXT,
-    category TEXT,
-    tags TEXT NOT NULL DEFAULT '[]',
-    source TEXT,
-    sort REAL NOT NULL DEFAULT 0,
-    created_at TEXT NOT NULL,
-    updated_at TEXT NOT NULL
-);
-CREATE INDEX IF NOT EXISTS findings_parent ON findings(parent_id);
-CREATE TABLE IF NOT EXISTS boards (
-    id TEXT PRIMARY KEY,
-    name TEXT NOT NULL,
-    width INTEGER NOT NULL,
-    height INTEGER NOT NULL,
-    background TEXT,
-    sort REAL NOT NULL DEFAULT 0,
-    created_at TEXT NOT NULL,
-    updated_at TEXT NOT NULL
-);
-CREATE TABLE IF NOT EXISTS placements (
-    board_id TEXT NOT NULL REFERENCES boards(id) ON DELETE CASCADE,
-    finding_id TEXT NOT NULL REFERENCES findings(id) ON DELETE CASCADE,
-    x INTEGER NOT NULL, y INTEGER NOT NULL,
-    w INTEGER NOT NULL, h INTEGER NOT NULL,
-    z INTEGER NOT NULL DEFAULT 0,
-    PRIMARY KEY (board_id, finding_id)
-);
-CREATE TABLE IF NOT EXISTS artifacts (
-    id TEXT PRIMARY KEY,
-    title TEXT NOT NULL,
-    description TEXT NOT NULL DEFAULT '',
-    entry TEXT NOT NULL DEFAULT 'index.html',
-    latest INTEGER NOT NULL DEFAULT 0,
-    source TEXT,
-    created_at TEXT NOT NULL,
-    updated_at TEXT NOT NULL
-);
-CREATE TABLE IF NOT EXISTS artifact_versions (
-    artifact_id TEXT NOT NULL REFERENCES artifacts(id) ON DELETE CASCADE,
-    version INTEGER NOT NULL,
-    note TEXT NOT NULL DEFAULT '',
-    source TEXT,
-    created_at TEXT NOT NULL,
-    PRIMARY KEY (artifact_id, version)
-);
-CREATE TABLE IF NOT EXISTS artifact_files (
-    artifact_id TEXT NOT NULL REFERENCES artifacts(id) ON DELETE CASCADE,
-    version INTEGER NOT NULL,
-    path TEXT NOT NULL,
-    content BLOB NOT NULL,
-    content_type TEXT NOT NULL,
-    sha256 TEXT,
-    size INTEGER,
-    pending INTEGER NOT NULL DEFAULT 0,
-    PRIMARY KEY (artifact_id, version, path)
-);
-CREATE TABLE IF NOT EXISTS artifact_upload (
-    artifact_id TEXT PRIMARY KEY REFERENCES artifacts(id) ON DELETE CASCADE,
-    token TEXT NOT NULL UNIQUE,
-    expires REAL NOT NULL
-);
-CREATE TABLE IF NOT EXISTS artifact_docs (
-    artifact_id TEXT NOT NULL REFERENCES artifacts(id) ON DELETE CASCADE,
-    collection TEXT NOT NULL,
-    doc_id TEXT NOT NULL,
-    data TEXT NOT NULL,
-    version INTEGER NOT NULL,
-    updated_at TEXT NOT NULL,
-    PRIMARY KEY (artifact_id, collection, doc_id)
-);
-CREATE TABLE IF NOT EXISTS artifact_db_rev (
-    artifact_id TEXT PRIMARY KEY REFERENCES artifacts(id) ON DELETE CASCADE,
-    rev INTEGER NOT NULL
-);
-"""
 
 
 class NotFound(LookupError):
@@ -143,26 +84,15 @@ class Conflict(ValueError):
     pass
 
 
+_UNSET: Any = object()
+
+
 def now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="milliseconds")
 
 
-def new_id(prefix: str, n: int = 8) -> str:
-    alphabet = "abcdefghjkmnpqrstuvwxyz23456789"
-    return prefix + "_" + "".join(secrets.choice(alphabet) for _ in range(n))
-
-
-def clean_path(path: str) -> str:
-    """A relative file path inside an artifact: forward slashes, no '..', no leading '/'."""
-    p = (path or "").replace("\\", "/").strip()
-    while p.startswith("./"):
-        p = p[2:]
-    parts = p.split("/")
-    if not p or p.startswith("/") or len(p) > 240 or any(s in ("", ".", "..") for s in parts):
-        raise ValueError(f"bad file path {path!r}; use a relative path like 'index.html' or 'data/rows.json'")
-    if parts[0] in ("_db", "_ritboard.js"):
-        raise ValueError(f"{parts[0]} is reserved for Ritboard; pick another file name")
-    return p
+def iso(ns: int) -> str:
+    return datetime.fromtimestamp(ns / 1e9, timezone.utc).isoformat(timespec="milliseconds")
 
 
 def check_collection(path: str) -> str:
@@ -208,21 +138,13 @@ CLAUDE_LINK = re.compile(r"^https?://([^/]*\.)?(claude\.ai|claude\.site)(:\d+)?(
 CLAUDE_LINK_ERROR = (
     "Ritboard does not show claude.ai artifacts: claude.ai refuses to be framed, so the card stays blank. "
     "Publish the artifact's HTML here instead with publish_artifact (html=... for one page, or files=[...]); "
-    "it gets its own address and versions, and every card showing it reloads when you update it."
+    "it becomes a folder in the workspace, and every card showing it reloads when you update it."
 )
 
 
 def check_not_claude_link(kind: str, content: str) -> None:
-    if kind == "url" and CLAUDE_LINK.match((content or "").strip()):
+    if kind in ("url", "image") and CLAUDE_LINK.match((content or "").strip()):
         raise ValueError(CLAUDE_LINK_ERROR)
-
-
-def parse_artifact_ref(ref: str) -> tuple[str, int | None]:
-    """'a_xxx' -> latest; 'a_xxx@3' -> version 3."""
-    aid, _, ver = (ref or "").strip().partition("@")
-    if ver and not ver.isdigit():
-        raise ValueError(f"bad artifact reference {ref!r}; use 'id' or 'id@version'")
-    return aid, int(ver) if ver else None
 
 
 def slugify(name: str) -> str:
@@ -230,141 +152,446 @@ def slugify(name: str) -> str:
     return s[:48] or "workspace"
 
 
+def clean_art_path(path: str) -> str:
+    """A file path inside an artifact folder."""
+    p = F.clean_rel(path)
+    if p.split("/")[0] in ("_db", "_events", "_ritboard.js"):
+        raise ValueError(f"{p.split('/')[0]} is reserved for Ritboard; pick another file name")
+    return p
+
+
+def _stamp(items) -> int:
+    """A number that changes when any of the (name, size, mtime) items change. 0 for none."""
+    items = sorted(items)
+    if not items:
+        return 0
+    h = hashlib.sha1(json.dumps(items).encode()).hexdigest()
+    return int(h[:13], 16)  # fits a JavaScript number
+
+
+def check_workspace_folder(path: str | Path, roots: list[Path] | None) -> Path:
+    """A folder an agent or the browser may make or open as a workspace."""
+    p = Path(path).expanduser()
+    if not p.is_absolute():
+        raise ValueError(f"give the folder as an absolute path on the computer running Ritboard: {path}")
+    p = p.resolve()
+    if any(part.startswith(".") for part in p.parts[1:]):
+        raise ValueError(f"{p} is inside a hidden folder; pick another folder")
+    if p == Path.home().resolve() or p.parent == p:
+        raise ValueError(f"{p} is too broad for a workspace; pick a project folder")
+    if roots is not None:
+        if not roots:
+            raise ValueError("this server doesn't open folders by path; start it with --allow-files <folder>")
+        if not any(p.is_relative_to(r.expanduser().resolve()) for r in roots):
+            raise ValueError(f"{p} is outside the folders Ritboard may use ({', '.join(str(r) for r in roots)})")
+    return p
+
+
+@dataclass
+class Entry:
+    path: str
+    kind: str
+    is_dir: bool
+    mtime_ns: int
+    size: int
+    meta: dict[str, Any] = field(default_factory=dict)
+    body: str | None = None  # text content, for text kinds
+    too_big: bool = False
+
+
 class WorkspaceStore:
-    def __init__(self, path: Path, ws_id: str, notify: Notify | None = None):
-        self.path = path
+    def __init__(self, root: Path, ws_id: str, notify: Notify | None = None, secret: bytes = b"", name: str | None = None):
+        self.root = Path(root).resolve()
         self.id = ws_id
+        self.rb = self.root / ".ritboard"
+        self.local = self.rb / "local"
         self._notify = notify or (lambda ws, what: None)
+        self._secret = secret
         self._lock = threading.RLock()
-        self.db = sqlite3.connect(path, check_same_thread=False, isolation_level=None)
-        self.db.row_factory = sqlite3.Row
-        self.db.execute("PRAGMA journal_mode=WAL")
-        self.db.execute("PRAGMA foreign_keys=ON")
-        self.db.executescript(SCHEMA)
-        self._migrate()
+        self._entries: dict[str, Entry] = {}
+        self._cache: dict[str, dict[str, Any]] = {}  # path -> parsed file, by (mtime, size)
+        self._yaml_cache: dict[str, tuple[tuple[int, int], Any]] = {}
+        self._fp_cache: dict[str, tuple[tuple[int, int], list]] = {}
+        self._fps: dict[str, list] = {}  # fingerprints of paths that boards or meta point at
+        self._known: set[str] | None = None  # paths seen in the previous scan
+        self._scanned = 0.0
+        self._dirty = True
+        self.truncated = False
+        self.problems: list[str] = []
+        self.ensure_layout(name)
 
-    def _migrate(self) -> None:
-        """Bring files made by older versions of Ritboard up to the current schema."""
-        cols = {r["name"] for r in self.db.execute("PRAGMA table_info(artifact_files)")}
-        for col, decl in (("sha256", "TEXT"), ("size", "INTEGER"), ("pending", "INTEGER NOT NULL DEFAULT 0")):
-            if col not in cols:
-                self.db.execute(f"ALTER TABLE artifact_files ADD COLUMN {col} {decl}")
+    # ---- layout ---------------------------------------------------------
+    def ensure_layout(self, name: str | None = None) -> None:
+        (self.rb / "boards").mkdir(parents=True, exist_ok=True)
+        gi = self.rb / ".gitignore"
+        if not gi.exists():
+            F.write_text(gi, "# Only on this computer: upload links, rename index, deleted files.\nlocal/\n")
+        if not (self.rb / "workspace.yaml").exists():
+            self._write_ws_yaml({"name": name or self.root.name, **{k: v for k, v in DEFAULT_SETTINGS.items()}})
 
-    # ---- plumbing -------------------------------------------------------
     def close(self) -> None:
-        with self._lock:
-            self.db.close()
+        pass
 
-    def _tx(self):
-        store = self
-
-        class Tx:
-            def __enter__(self_inner):
-                store._lock.acquire()
-                store.db.execute("BEGIN IMMEDIATE")
-                return store.db
-
-            def __exit__(self_inner, exc_type, exc, tb):
-                try:
-                    store.db.execute("ROLLBACK" if exc_type else "COMMIT")
-                finally:
-                    store._lock.release()
-                return False
-
-        return Tx()
-
-    def _q(self, sql: str, args: tuple = ()) -> list[sqlite3.Row]:
-        with self._lock:
-            return self.db.execute(sql, args).fetchall()
+    def changed(self, what: str) -> None:
+        # Scan now, so a file that was just placed is recognised if it's renamed next.
+        try:
+            self._fresh(force=True)
+        except OSError:
+            self._dirty = True
+        self._notify(self.id, what)
 
     def _art_event(self, aid: str, kind: str) -> None:
         """Tell open artifact pages: kind is version (files changed), db or deleted."""
         self._notify(self.id, f"artifact:{kind}:{aid}")
 
-    def changed(self, what: str) -> None:
-        self._touch()
-        self._notify(self.id, what)
+    def mark_dirty(self) -> None:
+        self._dirty = True
 
-    def _touch(self) -> None:
-        with self._lock:
-            self.db.execute(
-                "INSERT INTO meta(key,value) VALUES('updated_at',?) "
-                "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-                (now(),),
-            )
+    # ---- YAML files -------------------------------------------------------
+    def _yaml(self, p: Path, default: Any) -> Any:
+        try:
+            st = p.stat()
+        except FileNotFoundError:
+            return copy.deepcopy(default)
+        sig = (st.st_mtime_ns, st.st_size)
+        c = self._yaml_cache.get(str(p))
+        if c and c[0] == sig:
+            return copy.deepcopy(c[1])
+        data = F.load_yaml(p)
+        if data is None:
+            data = copy.deepcopy(default)
+        self._yaml_cache[str(p)] = (sig, data)
+        return copy.deepcopy(data)
 
-    # ---- meta / settings --------------------------------------------------
-    def get_meta(self, key: str, default: str | None = None) -> str | None:
-        rows = self._q("SELECT value FROM meta WHERE key=?", (key,))
-        return rows[0]["value"] if rows else default
+    def _write_yaml(self, p: Path, data: Any, flow_lists: bool = False) -> None:
+        F.write_text(p, F.dump_yaml(data, flow_lists))
+        self._yaml_cache.pop(str(p), None)
 
-    def set_meta(self, key: str, value: str) -> None:
-        with self._lock:
-            self.db.execute(
-                "INSERT INTO meta(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-                (key, value),
-            )
+    def _ws_yaml(self) -> dict[str, Any]:
+        raw = self._yaml(self.rb / "workspace.yaml", {})
+        return raw if isinstance(raw, dict) else {}
 
+    def _write_ws_yaml(self, raw: dict[str, Any]) -> None:
+        self._write_yaml(self.rb / "workspace.yaml", raw)
+
+    def _meta_yaml(self) -> dict[str, dict[str, Any]]:
+        try:
+            raw = self._yaml(self.rb / "meta.yaml", {})
+        except ValueError as e:
+            self._problem(str(e))
+            return {}
+        return {str(k): v for k, v in (raw or {}).items() if isinstance(v, dict)} if isinstance(raw, dict) else {}
+
+    def _save_meta_yaml(self, data: dict[str, dict[str, Any]]) -> None:
+        clean = {k: {mk: mv for mk, mv in v.items() if mv not in (None, "", [])} for k, v in sorted(data.items())}
+        clean = {k: v for k, v in clean.items() if v}
+        p = self.rb / "meta.yaml"
+        if not clean and not p.exists():
+            return
+        self._write_yaml(p, clean)
+
+    def _local_json(self, name: str, default: Any) -> Any:
+        try:
+            return json.loads((self.local / name).read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return copy.deepcopy(default)
+
+    def _save_local_json(self, name: str, data: Any) -> None:
+        self.local.mkdir(parents=True, exist_ok=True)
+        F.write_text(self.local / name, json.dumps(data, indent=1, sort_keys=True))
+
+    def _problem(self, msg: str) -> None:
+        if msg not in self.problems:
+            self.problems.append(msg)
+
+    # ---- workspace settings ----------------------------------------------
     @property
     def name(self) -> str:
-        return self.get_meta("name", self.id) or self.id
+        return str(self._ws_yaml().get("name") or self.root.name)
+
+    def set_name(self, name: str) -> None:
+        raw = self._ws_yaml()
+        raw["name"] = name.strip() or self.root.name
+        self._write_ws_yaml(raw)
+        self.changed("workspace")
 
     def settings(self) -> dict[str, Any]:
-        raw = self.get_meta("settings")
+        raw = self._ws_yaml()
         s = dict(DEFAULT_SETTINGS)
-        s["categories"] = {}
-        if raw:
-            s.update(json.loads(raw))
+        for k in ("board_width", "board_height", "grid"):
+            try:
+                s[k] = max(1, int(raw.get(k, s[k])))
+            except (TypeError, ValueError):
+                pass
+        cats = raw.get("categories")
+        s["categories"] = {str(k): str(v) for k, v in cats.items()} if isinstance(cats, dict) else {}
         return s
 
     def update_settings(self, patch: dict[str, Any]) -> dict[str, Any]:
-        s = self.settings()
+        raw = self._ws_yaml()
         for k, v in patch.items():
             if k == "categories" and isinstance(v, dict):
-                cats = dict(s.get("categories") or {})
+                cats = dict(raw.get("categories") or {})
                 for name, color in v.items():
                     if color is None:
                         cats.pop(name, None)
                     else:
                         cats[name] = color
-                s["categories"] = cats
+                raw["categories"] = cats
             elif k in ("board_width", "board_height", "grid"):
-                s[k] = max(1, int(v))
-            else:
-                s[k] = v
-        self.set_meta("settings", json.dumps(s))
+                raw[k] = max(1, int(v))
+        self._write_ws_yaml(raw)
         self.changed("settings")
-        return s
+        return self.settings()
 
     def _ensure_category(self, category: str | None) -> None:
         if not category:
             return
-        s = self.settings()
-        if category not in s["categories"]:
-            s["categories"][category] = PALETTE[len(s["categories"]) % len(PALETTE)]
-            self.set_meta("settings", json.dumps(s))
+        raw = self._ws_yaml()
+        cats = dict(raw.get("categories") or {})
+        if category not in cats:
+            cats[category] = PALETTE[len(cats) % len(PALETTE)]
+            raw["categories"] = cats
+            self._write_ws_yaml(raw)
 
     def summary(self) -> dict[str, Any]:
-        counts = self._q(
-            "SELECT (SELECT COUNT(*) FROM findings) f, (SELECT COUNT(*) FROM boards) b"
-        )[0]
+        self._fresh()
         return {
             "id": self.id,
             "name": self.name,
-            "created_at": self.get_meta("created_at"),
-            "updated_at": self.get_meta("updated_at"),
-            "findings": counts["f"],
-            "boards": counts["b"],
+            "path": str(self.root),
+            "findings": len(self._entries),
+            "boards": len(self._boards()),
+            "truncated": self.truncated,
         }
 
-    # ---- findings -------------------------------------------------------
+    # ---- scanning ---------------------------------------------------------
+    def _fresh(self, force: bool = False) -> None:
+        with self._lock:
+            if force or self._dirty or time.monotonic() - self._scanned > SCAN_EVERY_S:
+                self._scan()
+
+    def _scan(self) -> None:
+        entries: dict[str, Entry] = {}
+        count = 0
+        truncated = False
+
+        def walk(folder: Path, rel: str) -> None:
+            nonlocal count, truncated
+            try:
+                items = sorted(os.scandir(folder), key=lambda d: d.name.lower())
+            except OSError:
+                return
+            for de in items:
+                if F.skipped(de.name):
+                    continue
+                if count >= MAX_ENTRIES:
+                    truncated = True
+                    return
+                try:
+                    if de.is_symlink():
+                        continue
+                    is_dir = de.is_dir(follow_symlinks=False)
+                    st = de.stat(follow_symlinks=False)
+                except OSError:
+                    continue
+                path = f"{rel}/{de.name}" if rel else de.name
+                count += 1
+                if is_dir:
+                    art = os.path.isfile(os.path.join(de.path, "index.html"))
+                    entries[path] = Entry(path, "artifact" if art else "folder", True, st.st_mtime_ns, 0)
+                    if not art:
+                        walk(Path(de.path), path)
+                else:
+                    entries[path] = self._file_entry(path, Path(de.path), st)
+
+        self.problems = []
+        walk(self.root, "")
+        self._follow_moves(entries)
+        meta = self._meta_yaml()
+        for e in entries.values():
+            if self._meta_src(e) == "yaml":
+                e.meta = dict(meta.get(e.path) or {})
+            if e.kind == "url" and e.meta.get("kind") == "image":
+                e.kind = "image"
+        self._entries = entries
+        self.truncated = truncated
+        if truncated:
+            self._problem(f"Only the first {MAX_ENTRIES} files and folders are shown.")
+        self._cache = {k: v for k, v in self._cache.items() if k in entries}
+        self._scanned = time.monotonic()
+        self._dirty = False
+
+    def _file_entry(self, path: str, p: Path, st: os.stat_result) -> Entry:
+        kind = F.kind_for(p.name)
+        e = Entry(path, kind, False, st.st_mtime_ns, st.st_size)
+        if kind not in TEXT_KINDS:
+            return e
+        sig = (st.st_mtime_ns, st.st_size)
+        c = self._cache.get(path)
+        if not c or c["sig"] != sig:
+            c = {"sig": sig, "meta": {}, "body": None, "too_big": False, "rendered": None}
+            if st.st_size > MAX_SHOWN_BYTES:
+                c["too_big"] = True
+            else:
+                try:
+                    text, _ = F.read_text(p)
+                except OSError:
+                    text = ""
+                if kind == "md":
+                    c["meta"], c["body"] = F.split_front_matter(text)
+                elif kind == "html":
+                    c["meta"], c["body"] = F.split_html_meta(text)
+                elif kind == "url":
+                    c["body"] = F.parse_url_file(text)
+                else:
+                    c["body"] = text
+            self._cache[path] = c
+        e.meta = dict(c["meta"])
+        e.body = c["body"]
+        e.too_big = c["too_big"]
+        return e
+
     @staticmethod
-    def _finding(row: sqlite3.Row, with_content: bool = True) -> dict[str, Any]:
-        d = dict(row)
-        d["tags"] = json.loads(d.get("tags") or "[]")
-        if not with_content:
-            d.pop("content", None)
-            d.pop("rendered", None)
+    def _meta_src(e: Entry) -> str:
+        if not e.is_dir and e.kind == "md":
+            return "front"
+        if not e.is_dir and e.kind == "html":
+            return "html"
+        return "yaml"
+
+    # ---- following renames made outside Ritboard ----------------------------
+    def _tracked(self) -> set[str]:
+        out: set[str] = set()
+        for b in self._boards().values():
+            out.update(b["cards"])
+        out.update(self._meta_yaml())
+        out.update(self._local_json("uploads.json", {}))
+        return out
+
+    def _fingerprint(self, e: Entry) -> list:
+        """What a file or folder looks like, to recognise it after a rename."""
+        sig = (e.mtime_ns, e.size)
+        c = self._fp_cache.get(e.path)
+        if c and c[0] == sig and not e.is_dir:
+            return c[1]
+        p = self.root / e.path
+        try:
+            if e.is_dir:
+                names = sorted(n for n in os.listdir(p) if not F.skipped(n))
+                fp = ["d", e.kind, hashlib.sha1("\n".join(names).encode()).hexdigest()]
+            else:
+                h = hashlib.sha1()
+                with open(p, "rb") as fh:
+                    h.update(fh.read(1024 * 1024))
+                fp = ["f", e.size, h.hexdigest()]
+        except OSError:
+            return ["?"]
+        self._fp_cache[e.path] = (sig, fp)
+        return fp
+
+    def _follow_moves(self, entries: dict[str, Entry]) -> None:
+        if self._known is None:
+            saved = self._local_json("index.json", {})
+            self._known = set(saved.get("known", [])) if saved else None
+            self._fps = dict(saved.get("fingerprints", {})) if saved else {}
+        tracked = self._tracked()
+        vanished = [p for p in tracked if p not in entries]
+        if vanished and self._known is not None:
+            fresh = [p for p in entries if p not in self._known]
+            for old in sorted(vanished, key=lambda p: p.count("/")):
+                fp = self._fps.get(old)
+                if not fp or old not in self._tracked():
+                    continue
+                cands = []
+                for q in fresh:
+                    e = entries[q]
+                    if (fp[0] == "f") == e.is_dir or (fp[0] == "f" and fp[1] != e.size):
+                        continue
+                    if self._fingerprint(e) == fp:
+                        cands.append(q)
+                if len(cands) == 1:
+                    self._repoint(old, cands[0])
+            tracked = self._tracked()
+        fps = {p: self._fingerprint(entries[p]) for p in tracked if p in entries}
+        for p, fp in self._fps.items():  # keep what we knew about paths that are gone for now
+            if p in tracked and p not in fps:
+                fps[p] = fp
+        known = set(entries)
+        if fps != self._fps or known != self._known:
+            self._fps, self._known = fps, known
+            try:
+                self._save_local_json("index.json", {"known": sorted(known), "fingerprints": fps})
+            except OSError:
+                pass
+
+    def _repoint(self, old: str, new: str) -> None:
+        """A file or folder moved from old to new: boards, metadata and uploads follow."""
+
+        def move(k: str) -> str:
+            return new + k[len(old):] if F.is_under(k, old) else k
+
+        for b in self._boards().values():
+            if any(F.is_under(k, old) for k in b["cards"]):
+                b["cards"] = {move(k): v for k, v in b["cards"].items()}
+                self._save_board(b)
+        meta = self._meta_yaml()
+        if any(F.is_under(k, old) for k in meta):
+            self._save_meta_yaml({move(k): v for k, v in meta.items()})
+        ups = self._local_json("uploads.json", {})
+        if any(F.is_under(k, old) for k in ups):
+            self._save_local_json("uploads.json", {move(k): v for k, v in ups.items()})
+        self._fps = {move(k): v for k, v in self._fps.items()}
+
+    # ---- findings -------------------------------------------------------
+    def _entry(self, fid: str) -> Entry:
+        self._fresh()
+        key = (fid or "").replace("\\", "/").strip().strip("/")
+        e = self._entries.get(key)
+        if e is None:
+            self._fresh(force=True)
+            e = self._entries.get(key)
+        if e is None:
+            raise NotFound(f"finding {fid!r} not found; ids are paths inside the workspace, like 'Notes/idea.md'")
+        return e
+
+    def _title(self, e: Entry) -> str:
+        t = e.meta.get("title")
+        return str(t) if t else self._display_name(e.path, e.is_dir)
+
+    def raw_url(self, path: str) -> str:
+        return f"/api/w/{urllib.parse.quote(self.id)}/raw?path={urllib.parse.quote(path)}"
+
+    def _finding(self, e: Entry, with_content: bool = True) -> dict[str, Any]:
+        m = e.meta
+        tags = m.get("tags") or []
+        d: dict[str, Any] = {
+            "id": e.path,
+            "parent_id": F.parent_of(e.path),
+            "title": self._title(e),
+            "kind": e.kind,
+            "category": str(m["category"]) if m.get("category") else None,
+            "tags": [str(t) for t in tags] if isinstance(tags, list) else [str(tags)],
+            "source": str(m["source"]) if m.get("source") else None,
+            "updated_at": iso(e.mtime_ns),
+        }
+        if e.kind == "artifact":
+            d.update(self._art_summary(e))
+        elif e.kind in ("image", "file"):
+            d["src"] = e.body if e.path.lower().endswith(".url") else self.raw_url(e.path)
+            d["size"] = e.size
+        if with_content:
+            if e.too_big:
+                d["content"], d["too_big"] = "", True
+                d["rendered"] = f"<p><em>Too large to show here ({e.size / 1048576:.1f} MB).</em></p>"
+            elif e.kind in TEXT_KINDS or (e.kind == "image" and e.body):
+                d["content"] = e.body or ""
+                c = self._cache.get(e.path)
+                if c is not None and c.get("rendered") is None:
+                    c["rendered"] = render(e.kind, e.body or "") or ""
+                d["rendered"] = (c or {}).get("rendered") or render(e.kind, e.body or "")
+            else:
+                d["content"], d["rendered"] = "", None
         return d
 
     def list_findings(
@@ -375,39 +602,90 @@ class WorkspaceStore:
         parent_id: str | None = None,
         query: str | None = None,
     ) -> list[dict[str, Any]]:
-        sql = "SELECT * FROM findings WHERE 1=1"
-        args: list[Any] = []
-        if category is not None:
-            sql += " AND category=?"
-            args.append(category)
-        if parent_id is not None:
-            sql += " AND parent_id IS ?" if parent_id == "" else " AND parent_id=?"
-            args.append(None if parent_id == "" else parent_id)
-        if query:
-            sql += " AND (title LIKE ? OR content LIKE ? OR tags LIKE ?)"
-            q = f"%{query}%"
-            args += [q, q, q]
-        sql += " ORDER BY sort, created_at"
-        return [self._finding(r, with_content) for r in self._q(sql, tuple(args))]
+        self._fresh()
+        out = []
+        q = (query or "").lower()
+        for e in self._entries.values():
+            if parent_id is not None and (F.parent_of(e.path) or "") != parent_id.strip("/"):
+                continue
+            f = self._finding(e, with_content or bool(q))
+            if category is not None and f["category"] != (category or None):
+                continue
+            if q and not (
+                q in f["title"].lower() or q in (f.get("content") or "").lower() or any(q in t.lower() for t in f["tags"])
+            ):
+                continue
+            if not with_content:
+                f.pop("content", None)
+                f.pop("rendered", None)
+            out.append(f)
+        return out
 
     def get_finding(self, fid: str) -> dict[str, Any]:
-        rows = self._q("SELECT * FROM findings WHERE id=?", (fid,))
-        if not rows:
-            raise NotFound(f"finding {fid} not found")
-        return self._finding(rows[0])
+        return self._finding(self._entry(fid))
 
-    def _check_parent(self, fid: str | None, parent_id: str | None) -> None:
-        if parent_id is None:
-            return
-        self.get_finding(parent_id)
-        if fid is None:
-            return
-        cur: str | None = parent_id
-        while cur:
-            if cur == fid:
-                raise ValueError("cannot move a finding inside itself")
-            row = self._q("SELECT parent_id FROM findings WHERE id=?", (cur,))
-            cur = row[0]["parent_id"] if row else None
+    def _folder(self, parent_id: str | None) -> str | None:
+        """Check that parent_id names a folder (None is the workspace itself)."""
+        if not parent_id:
+            return None
+        e = self._entry(parent_id)
+        if e.kind != "folder":
+            raise ValueError(f"{e.path} is a {e.kind}, not a folder; findings can only go inside folders")
+        return e.path
+
+    def _free_path(self, parent: str | None, base: str, ext: str, taken: str | None = None) -> str:
+        """parent/base+ext, or with " 2", " 3"... added if that name is in use. `taken` is the
+        finding being renamed: its own name counts as free."""
+        for n in range(1, 1000):
+            name = f"{base}{ext}" if n == 1 else f"{base} {n}{ext}"
+            path = f"{parent}/{name}" if parent else name
+            if (taken and path.lower() == taken.lower()) or not (self.root / path).exists():
+                return path
+        raise ValueError(f"too many files called {base}")
+
+    def _new_path(self, parent: str | None, title: str, ext: str) -> str:
+        return self._free_path(parent, F.safe_name(title), ext)
+
+    def _display_name(self, path: str, is_dir: bool) -> str:
+        """The title a file or folder gets from its name alone."""
+        name = path.rsplit("/", 1)[-1]
+        if is_dir:
+            return name
+        ext = Path(name).suffix.lower()
+        return Path(name).stem if ext in F.KIND_BY_EXT or ext in F.IMAGE_EXTS else name
+
+    def _title_meta(self, title: str, path: str, is_dir: bool) -> str | None:
+        """Keep the title in metadata only when the name can't say it."""
+        return None if self._display_name(path, is_dir) == title else title
+
+    def _write_file(self, path: str, kind: str, meta: dict[str, Any], body: str | None) -> None:
+        """Write a text finding with its metadata, wherever that format keeps it. body None
+        keeps the text that is in the file now."""
+        p = self.root / path
+        nl = "\n"
+        if p.exists():
+            text, nl = F.read_text(p)
+            if body is None:
+                body = (F.split_front_matter(text)[1] if kind == "md" else F.split_html_meta(text)[1] if kind == "html"
+                        else F.parse_url_file(text) if path.lower().endswith(".url") else text)
+        body = body or ""
+        all_meta = self._meta_yaml()
+        if kind == "md":
+            F.write_text(p, F.join_front_matter(meta, body), nl)
+            all_meta.pop(path, None)
+        elif kind == "html":
+            F.write_text(p, F.join_html_meta(meta, body), nl)
+            all_meta.pop(path, None)
+        else:
+            F.write_text(p, F.url_file(body) if path.lower().endswith(".url") else body, nl)
+            all_meta[path] = meta
+        self._save_meta_yaml(all_meta)
+        self._cache.pop(path, None)
+
+    def _set_yaml_meta(self, path: str, meta: dict[str, Any]) -> None:
+        all_meta = self._meta_yaml()
+        all_meta[path] = meta
+        self._save_meta_yaml(all_meta)
 
     def add_finding(
         self,
@@ -420,40 +698,52 @@ class WorkspaceStore:
         source: str | None = None,
     ) -> dict[str, Any]:
         kind = normalize_kind(kind)
-        parent_id = parent_id or None
-        self._check_parent(None, parent_id)
-        if kind == "artifact":
-            content = self._check_artifact_ref(content)
+        content = content or ""
         check_not_claude_link(kind, content)
-        fid = new_id("f")
-        t = now()
-        with self._tx() as db:
-            sort = db.execute(
-                "SELECT COALESCE(MAX(sort),0)+1 FROM findings WHERE parent_id IS ?", (parent_id,)
-            ).fetchone()[0]
-            db.execute(
-                "INSERT INTO findings(id,parent_id,title,kind,content,rendered,category,tags,source,sort,created_at,updated_at)"
-                " VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
-                (
-                    fid,
-                    parent_id,
-                    title,
-                    kind,
-                    content or "",
-                    render(kind, content or ""),
-                    category or None,
-                    json.dumps(tags or []),
-                    source,
-                    sort,
-                    t,
-                    t,
-                ),
+        title = (title or "").strip() or "Untitled"
+        if kind == "artifact":
+            a = self.create_artifact(
+                title, {"index.html": content.encode("utf-8")}, source=source, parent_id=parent_id, category=category, tags=tags
             )
-        self._ensure_category(category)
+            return self.get_finding(a["id"])
+        with self._lock:
+            self._fresh(force=True)
+            parent = self._folder(parent_id)
+            meta: dict[str, Any] = {"category": category or None, "tags": list(tags or []) or None, "source": source or None}
+            if kind == "folder":
+                path = self._new_path(parent, title, "")
+                (self.root / path).mkdir(parents=True)
+                self._set_yaml_meta(path, {"title": self._title_meta(title, path, True), **meta})
+            elif kind == "image":
+                path = self._add_image(parent, title, content, meta)
+            elif kind == "file":
+                raise ValueError("to add a file of another type, copy it into the workspace folder")
+            else:
+                if kind == "url" and not re.match(r"^[a-z][a-z0-9+.-]*:", content.strip(), re.I):
+                    raise ValueError("a url finding needs a URL as its content, like https://example.com")
+                path = self._new_path(parent, title, F.EXT_BY_KIND[kind])
+                self._write_file(path, kind, {"title": self._title_meta(title, path, False), **meta}, content)
+            self._ensure_category(category)
         self.changed("findings")
-        return self.get_finding(fid)
+        return self.get_finding(path)
 
-    _UNSET: Any = object()
+    def _add_image(self, parent: str | None, title: str, content: str, meta: dict[str, Any]) -> str:
+        c = content.strip()
+        m = re.match(r"^data:([\w/+.-]+)(;base64)?,(.*)$", c, re.S)
+        if m:
+            ext = F.IMAGE_EXT_BY_MIME.get(m.group(1).lower())
+            if not ext:
+                raise ValueError(f"unsupported image type {m.group(1)}")
+            data = base64.b64decode(m.group(3)) if m.group(2) else urllib.parse.unquote_to_bytes(m.group(3))
+            path = self._new_path(parent, title, ext)
+            F.write_bytes(self.root / path, data)
+            self._set_yaml_meta(path, {"title": self._title_meta(title, path, False), **meta})
+            return path
+        if re.match(r"^https?://", c, re.I):
+            path = self._new_path(parent, title, ".url")
+            self._write_file(path, "url", {"title": self._title_meta(title, path, False), "kind": "image", **meta}, c)
+            return path
+        raise ValueError("an image finding needs an https:// URL or a data: URI as its content")
 
     def update_finding(
         self,
@@ -465,91 +755,207 @@ class WorkspaceStore:
         category: Any = _UNSET,
         tags: list[str] | None = None,
         parent_id: Any = _UNSET,
-        sort: float | None = None,
+        sort: float | None = None,  # kept for old clients; the tree is sorted by name
         source: str | None = None,
     ) -> dict[str, Any]:
-        cur = self.get_finding(fid)
-        sets: dict[str, Any] = {}
-        if title is not None:
-            sets["title"] = title
-        if kind is not None:
-            sets["kind"] = normalize_kind(kind)
-        if content is not None:
-            sets["content"] = content
-        if category is not self._UNSET:
-            sets["category"] = category or None
-        if tags is not None:
-            sets["tags"] = json.dumps(tags)
-        if source is not None:
-            sets["source"] = source
-        if sort is not None:
-            sets["sort"] = float(sort)
-        if parent_id is not self._UNSET:
-            parent_id = parent_id or None
-            self._check_parent(fid, parent_id)
-            sets["parent_id"] = parent_id
-            if sort is None:
-                sets["sort"] = self._q(
-                    "SELECT COALESCE(MAX(sort),0)+1 m FROM findings WHERE parent_id IS ?", (parent_id,)
-                )[0]["m"]
-        if sets.get("kind", cur["kind"]) == "artifact" and ("kind" in sets or "content" in sets):
-            sets["content"] = self._check_artifact_ref(sets.get("content", cur["content"]))
-        if "kind" in sets or "content" in sets:
-            check_not_claude_link(sets.get("kind", cur["kind"]), sets.get("content", cur["content"]))
-        if "kind" in sets or "content" in sets:
-            sets["rendered"] = render(sets.get("kind", cur["kind"]), sets.get("content", cur["content"]))
-        if not sets:
-            return cur
-        sets["updated_at"] = now()
-        cols = ", ".join(f"{k}=?" for k in sets)
-        with self._tx() as db:
-            db.execute(f"UPDATE findings SET {cols} WHERE id=?", (*sets.values(), fid))
-        if sets.get("category"):
-            self._ensure_category(sets["category"])
+        with self._lock:
+            self._fresh(force=True)
+            e = self._entry(fid)
+            path = e.path
+            new_kind = normalize_kind(kind) if kind else e.kind
+            if new_kind != e.kind and not (e.kind in TEXT_KINDS and new_kind in TEXT_KINDS):
+                raise ValueError(
+                    f"a {e.kind} can't become a {new_kind}; only md, text, csv, html and url convert into each other"
+                )
+            if content is not None or new_kind != e.kind:
+                check_not_claude_link(new_kind, content if content is not None else (e.body or ""))
+            if content is not None and new_kind == "url" and not re.match(r"^[a-z][a-z0-9+.-]*:", content.strip(), re.I):
+                raise ValueError("a url finding needs a URL as its content")
+            if content is not None and e.kind in ("folder", "artifact", "file") or (content is not None and e.kind == "image" and not e.body):
+                if content:
+                    raise ValueError(f"a {e.kind} has no text content to change")
+                content = None
+
+            meta = dict(e.meta)
+            meta_changed = False
+            if category is not _UNSET:
+                meta["category"] = category or None
+                meta_changed = True
+            if tags is not None:
+                meta["tags"] = list(tags) or None
+                meta_changed = True
+            if source is not None:
+                meta["source"] = source or None
+                meta_changed = True
+
+            cur_title = self._title(e)
+            new_title = (title or "").strip() or cur_title
+            rename = title is not None and new_title != cur_title
+            move = parent_id is not _UNSET and (parent_id or None) != F.parent_of(path)
+            convert = new_kind != e.kind
+            target = path
+            if rename or move or convert:
+                parent = self._folder(parent_id) if move else F.parent_of(path)
+                if move and e.is_dir and parent and F.is_under(parent, path):
+                    raise ValueError("cannot move a folder inside itself")
+                name = path.rsplit("/", 1)[-1]
+                old_ext = "" if e.is_dir else Path(name).suffix
+                ext = F.EXT_BY_KIND[new_kind] if convert else old_ext
+                if rename:
+                    t = new_title
+                    if not e.is_dir and old_ext and t.lower().endswith(old_ext.lower()):
+                        t = t[: -len(old_ext)]  # titles of .py, .json... files include the extension
+                    base = F.safe_name(t)
+                else:
+                    base = name if e.is_dir else Path(name).stem
+                target = self._free_path(parent, base, ext, taken=path)
+            if rename or target != path:
+                keep = new_title if rename else cur_title
+                meta["title"] = self._title_meta(keep, target, e.is_dir)
+                meta_changed = True
+
+            if convert:
+                body = content if content is not None else e.body
+                if body is None:
+                    body = F.read_text(self.root / path)[0]
+                self._repoint(path, target)
+                self._write_file(target, new_kind, meta, body)
+                (self.root / path).unlink()
+                self._cache.pop(path, None)
+            else:
+                if target != path:
+                    os.rename(self.root / path, self.root / target)
+                    self._repoint(path, target)
+                    self._cache.pop(path, None)
+                if content is not None or meta_changed:
+                    if self._meta_src(e) == "yaml" and content is None:
+                        self._set_yaml_meta(target, meta)
+                    else:
+                        self._write_file(target, "url" if e.kind == "image" else e.kind, meta, content)
+            if meta.get("category"):
+                self._ensure_category(meta["category"])
+            self._dirty = True
         self.changed("findings")
-        return self.get_finding(fid)
+        return self.get_finding(target)
+
+    def _trash(self, path: str) -> Path:
+        dest = self.local / "trash" / time.strftime("%Y%m%d-%H%M%S") / path
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        shutil.move(str(self.root / path), str(dest))
+        return dest
+
+    def _forget(self, path: str) -> None:
+        """Take a removed path (and everything under it) off the boards and out of the metadata."""
+        for b in self._boards().values():
+            if any(F.is_under(k, path) for k in b["cards"]):
+                b["cards"] = {k: v for k, v in b["cards"].items() if not F.is_under(k, path)}
+                self._save_board(b)
+        meta = self._meta_yaml()
+        if any(F.is_under(k, path) for k in meta):
+            self._save_meta_yaml({k: v for k, v in meta.items() if not F.is_under(k, path)})
+        ups = self._local_json("uploads.json", {})
+        if any(F.is_under(k, path) for k in ups):
+            self._save_local_json("uploads.json", {k: v for k, v in ups.items() if not F.is_under(k, path)})
 
     def delete_finding(self, fid: str, recursive: bool = False) -> dict[str, Any]:
-        cur = self.get_finding(fid)
-        with self._tx() as db:
-            if not recursive:
-                db.execute(
-                    "UPDATE findings SET parent_id=? WHERE parent_id=?", (cur["parent_id"], fid)
-                )
-            n = db.execute(
-                "WITH RECURSIVE sub(id) AS (SELECT ? UNION ALL SELECT f.id FROM findings f JOIN sub ON f.parent_id=sub.id)"
-                " SELECT COUNT(*) FROM sub",
-                (fid,),
-            ).fetchone()[0]
-            db.execute("DELETE FROM findings WHERE id=?", (fid,))
+        """Move a finding's file or folder to .ritboard/local/trash. A folder's contents move up
+        a level first unless recursive is true."""
+        with self._lock:
+            self._fresh(force=True)
+            e = self._entry(fid)
+            parent = F.parent_of(e.path)
+            if e.kind == "folder" and not recursive:
+                for child in [c for c in self._entries.values() if F.parent_of(c.path) == e.path]:
+                    name = child.path.rsplit("/", 1)[-1]
+                    target = f"{parent}/{name}" if parent else name
+                    if (self.root / target).exists():
+                        stem, ext = (name, "") if child.is_dir else (Path(name).stem, Path(name).suffix)
+                        target = self._new_path(parent, stem, ext)
+                    os.rename(self.root / child.path, self.root / target)
+                    self._repoint(child.path, target)
+                n = 1
+            else:
+                n = sum(1 for p in self._entries if F.is_under(p, e.path))
+            self._forget(e.path)
+            dest = self._trash(e.path)
+            self._dirty = True
         self.changed("findings")
-        return {"deleted": n}
+        if e.kind == "artifact":
+            self._art_event(e.path, "deleted")
+        return {"deleted": n, "trashed_to": str(dest)}
 
     # ---- boards ---------------------------------------------------------
+    def _boards(self) -> dict[str, dict[str, Any]]:
+        s = self.settings()
+        out: dict[str, dict[str, Any]] = {}
+        for p in sorted((self.rb / "boards").glob("*.yaml")):
+            try:
+                raw = self._yaml(p, {})
+            except ValueError as e:
+                self._problem(f"Board file {p.name} can't be read: {e}")
+                continue
+            if not isinstance(raw, dict):
+                continue
+            cards: dict[str, list[int]] = {}
+            for k, v in (raw.get("cards") or {}).items():
+                try:
+                    vals = [int(x) for x in v][:5]
+                except (TypeError, ValueError):
+                    continue
+                if len(vals) >= 4:
+                    cards[str(k)] = vals + [0] * (5 - len(vals))
+            out[p.stem] = {
+                "id": p.stem,
+                "name": str(raw.get("name") or p.stem),
+                "width": int(raw.get("width") or s["board_width"]),
+                "height": int(raw.get("height") or s["board_height"]),
+                "background": raw.get("background") or None,
+                "order": float(raw.get("order") or 0),
+                "cards": cards,
+            }
+        return out
+
+    def _save_board(self, b: dict[str, Any]) -> None:
+        data: dict[str, Any] = {"name": b["name"], "width": b["width"], "height": b["height"]}
+        if b.get("background"):
+            data["background"] = b["background"]
+        data["order"] = int(b["order"]) if float(b["order"]).is_integer() else b["order"]
+        data["cards"] = {k: list(v) for k, v in sorted(b["cards"].items())}
+        self._write_yaml(self.rb / "boards" / f"{b['id']}.yaml", data, flow_lists=True)
+
+    @staticmethod
+    def _board_out(b: dict[str, Any]) -> dict[str, Any]:
+        return {k: b[k] for k in ("id", "name", "width", "height", "background", "order")}
+
     def list_boards(self) -> list[dict[str, Any]]:
-        return [dict(r) for r in self._q("SELECT * FROM boards ORDER BY sort, created_at")]
+        return [self._board_out(b) for b in sorted(self._boards().values(), key=lambda b: (b["order"], b["name"].lower()))]
+
+    def _board(self, bid: str) -> dict[str, Any]:
+        boards = self._boards()
+        if bid in boards:
+            return boards[bid]
+        for b in boards.values():  # agents tend to use the name
+            if b["name"].lower() == (bid or "").strip().lower():
+                return b
+        raise NotFound(f"board {bid!r} not found; boards: {', '.join(b['name'] for b in boards.values()) or 'none'}")
 
     def get_board_row(self, bid: str) -> dict[str, Any]:
-        rows = self._q("SELECT * FROM boards WHERE id=?", (bid,))
-        if not rows:
-            # Allow lookup by name, which agents tend to use.
-            rows = self._q("SELECT * FROM boards WHERE lower(name)=lower(?)", (bid,))
-        if not rows:
-            raise NotFound(f"board {bid} not found")
-        return dict(rows[0])
+        return self._board_out(self._board(bid))
 
     def create_board(
         self, name: str, width: int | None = None, height: int | None = None, background: str | None = None
     ) -> dict[str, Any]:
         s = self.settings()
-        bid = new_id("b")
-        t = now()
-        with self._tx() as db:
-            sort = db.execute("SELECT COALESCE(MAX(sort),0)+1 FROM boards").fetchone()[0]
-            db.execute(
-                "INSERT INTO boards(id,name,width,height,background,sort,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?)",
-                (bid, name, int(width or s["board_width"]), int(height or s["board_height"]), background, sort, t, t),
-            )
+        boards = self._boards()
+        base = slugify(name) if slugify(name) != "workspace" else "board"
+        bid, n = base, 2
+        while bid in boards or (self.rb / "boards" / f"{bid}.yaml").exists():
+            bid, n = f"{base}-{n}", n + 1
+        order = max([b["order"] for b in boards.values()], default=0) + 1
+        self._save_board({
+            "id": bid, "name": name.strip() or bid, "width": int(width or s["board_width"]),
+            "height": int(height or s["board_height"]), "background": background, "order": order, "cards": {},
+        })
         self.changed("boards")
         return self.get_board_row(bid)
 
@@ -563,44 +969,49 @@ class WorkspaceStore:
         background: Any = _UNSET,
         sort: float | None = None,
     ) -> dict[str, Any]:
-        bid = self.get_board_row(bid)["id"]
-        sets: dict[str, Any] = {}
+        b = self._board(bid)
         if name is not None:
-            sets["name"] = name
+            b["name"] = name.strip() or b["name"]
         if width is not None:
-            sets["width"] = max(100, int(width))
+            b["width"] = max(100, int(width))
         if height is not None:
-            sets["height"] = max(100, int(height))
-        if background is not self._UNSET:
-            sets["background"] = background or None
+            b["height"] = max(100, int(height))
+        if background is not _UNSET:
+            b["background"] = background or None
         if sort is not None:
-            sets["sort"] = float(sort)
-        if sets:
-            sets["updated_at"] = now()
-            cols = ", ".join(f"{k}=?" for k in sets)
-            with self._tx() as db:
-                db.execute(f"UPDATE boards SET {cols} WHERE id=?", (*sets.values(), bid))
-            self.changed("boards")
-        return self.get_board_row(bid)
+            b["order"] = float(sort)
+        self._save_board(b)
+        self.changed("boards")
+        return self._board_out(b)
 
     def delete_board(self, bid: str) -> None:
-        bid = self.get_board_row(bid)["id"]
-        with self._tx() as db:
-            db.execute("DELETE FROM boards WHERE id=?", (bid,))
+        b = self._board(bid)
+        p = self.rb / "boards" / f"{b['id']}.yaml"
+        dest = self.local / "trash" / time.strftime("%Y%m%d-%H%M%S") / ".ritboard" / "boards" / p.name
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        shutil.move(str(p), str(dest))
         self.changed("boards")
 
     # ---- placements -----------------------------------------------------
     def placements(self, bid: str | None = None) -> list[dict[str, Any]]:
-        if bid:
-            return [dict(r) for r in self._q("SELECT * FROM placements WHERE board_id=? ORDER BY z", (bid,))]
-        return [dict(r) for r in self._q("SELECT * FROM placements ORDER BY board_id, z")]
+        self._fresh()
+        boards = [self._board(bid)] if bid else list(self._boards().values())
+        out = []
+        for b in boards:
+            for fid, (x, y, w, h, z) in sorted(b["cards"].items(), key=lambda kv: kv[1][4]):
+                p = {"board_id": b["id"], "finding_id": fid, "x": x, "y": y, "w": w, "h": h, "z": z}
+                if fid not in self._entries:
+                    p["missing"] = True
+                out.append(p)
+        return out
 
-    def _free_spot(self, board: dict[str, Any], w: int, h: int, taken: list[dict[str, Any]]) -> tuple[int, int]:
+    @staticmethod
+    def _free_spot(board: dict[str, Any], w: int, h: int, taken: list[list[int]]) -> tuple[int, int]:
         gap, step = 20, 20
         for y in range(40, max(41, board["height"] - h), step):
             for x in range(40, max(41, board["width"] - w), step):
                 if all(
-                    x + w + gap <= p["x"] or p["x"] + p["w"] + gap <= x or y + h + gap <= p["y"] or p["y"] + p["h"] + gap <= y
+                    x + w + gap <= p[0] or p[0] + p[2] + gap <= x or y + h + gap <= p[1] or p[1] + p[3] + gap <= y
                     for p in taken
                 ):
                     return x, y
@@ -613,129 +1024,170 @@ class WorkspaceStore:
         Missing x/y on a new placement means "find a free spot".
         Missing fields on an existing placement keep their value.
         """
-        board = self.get_board_row(bid)
-        bid = board["id"]
-        out = []
-        with self._tx() as db:
-            taken = [dict(r) for r in db.execute("SELECT * FROM placements WHERE board_id=?", (bid,))]
-            zmax = max([p["z"] for p in taken], default=0)
+        with self._lock:
+            self._fresh()
+            b = self._board(bid)
+            out = []
+            zmax = max([v[4] for v in b["cards"].values()], default=0)
             for it in items:
-                fid = it["finding_id"]
-                f = db.execute("SELECT kind FROM findings WHERE id=?", (fid,)).fetchone()
-                if not f:
-                    raise NotFound(f"finding {fid} not found")
-                cur = next((p for p in taken if p["finding_id"] == fid), None)
-                dw, dh = DEFAULT_SIZES.get(f["kind"], (420, 300))
-                w = int(it.get("w") or (cur["w"] if cur else dw))
-                h = int(it.get("h") or (cur["h"] if cur else dh))
+                fid = str(it["finding_id"]).replace("\\", "/").strip("/")
+                cur = b["cards"].get(fid)
+                if cur is None:
+                    kind = self._entry(fid).kind
+                else:
+                    kind = self._entries[fid].kind if fid in self._entries else "md"
+                dw, dh = DEFAULT_SIZES.get(kind, (420, 300))
+                w = int(it.get("w") or (cur[2] if cur else dw))
+                h = int(it.get("h") or (cur[3] if cur else dh))
                 w, h = max(40, w), max(30, h)
                 if it.get("x") is not None and it.get("y") is not None:
                     x, y = int(it["x"]), int(it["y"])
                 elif cur:
-                    x = int(it["x"]) if it.get("x") is not None else cur["x"]
-                    y = int(it["y"]) if it.get("y") is not None else cur["y"]
+                    x = int(it["x"]) if it.get("x") is not None else cur[0]
+                    y = int(it["y"]) if it.get("y") is not None else cur[1]
                 else:
-                    x, y = self._free_spot(board, w, h, taken)
+                    taken = [v for k, v in b["cards"].items() if k != fid]
+                    x, y = self._free_spot(b, w, h, taken)
                 if it.get("z") is not None:
                     z = int(it["z"])
                 elif cur:
-                    z = cur["z"]
+                    z = cur[4]
                 else:
                     zmax += 1
                     z = zmax
-                db.execute(
-                    "INSERT INTO placements(board_id,finding_id,x,y,w,h,z) VALUES(?,?,?,?,?,?,?)"
-                    " ON CONFLICT(board_id,finding_id) DO UPDATE SET x=excluded.x,y=excluded.y,w=excluded.w,h=excluded.h,z=excluded.z",
-                    (bid, fid, x, y, w, h, z),
-                )
-                p = {"board_id": bid, "finding_id": fid, "x": x, "y": y, "w": w, "h": h, "z": z}
-                taken = [t for t in taken if t["finding_id"] != fid] + [p]
-                out.append(p)
+                b["cards"][fid] = [x, y, w, h, z]
+                out.append({"board_id": b["id"], "finding_id": fid, "x": x, "y": y, "w": w, "h": h, "z": z})
+            self._save_board(b)
         self.changed("placements")
         return out
 
     def unplace(self, bid: str, finding_ids: list[str]) -> int:
-        bid = self.get_board_row(bid)["id"]
-        with self._tx() as db:
-            n = 0
-            for fid in finding_ids:
-                n += db.execute(
-                    "DELETE FROM placements WHERE board_id=? AND finding_id=?", (bid, fid)
-                ).rowcount
+        b = self._board(bid)
+        n = 0
+        for fid in finding_ids:
+            if b["cards"].pop(str(fid).strip("/"), None) is not None:
+                n += 1
+        self._save_board(b)
         self.changed("placements")
         return n
 
     # ---- artifacts ------------------------------------------------------
-    # An artifact is a small website kept in this workspace: an entry page plus any other
-    # files, stored whole for every version. Cards of kind "artifact" point at one by id.
+    # An artifact is a folder with index.html and any other files the page uses. Its id is
+    # its path in the workspace. It is served at /w/<workspace>/a/<key>/, where the key is
+    # derived from a secret on this computer, so the address can't be guessed.
     #
     # Big files can be registered as shadow files: path, SHA-256 and size, no content. The
-    # version is published at once; each shadow file gets a PUT link and fills in when its
+    # artifact is published at once; each shadow file gets a PUT link and is written when its
     # bytes arrive (checked against the hash). The links carry an upload secret that is
     # replaced on every publish, so only links from the latest publish work.
 
-    def _check_artifact_ref(self, ref: str) -> str:
-        aid, ver = parse_artifact_ref(ref)
-        a = self.artifact_meta(aid)
-        if ver is not None and not 1 <= ver <= a["latest"]:
-            raise ValueError(f"artifact {aid} has versions 1 to {a['latest']}")
-        return f"{aid}@{ver}" if ver else aid
+    def art_key(self, aid: str) -> str:
+        return hmac.new(self._secret, f"{self.id}\0{aid}".encode(), hashlib.sha256).hexdigest()[:24]
+
+    def art_url(self, aid: str) -> str:
+        return f"/w/{urllib.parse.quote(self.id)}/a/{self.art_key(aid)}/"
+
+    def artifact_by_key(self, key: str) -> str:
+        self._fresh()
+        for e in self._entries.values():
+            if e.kind == "artifact" and hmac.compare_digest(self.art_key(e.path), key):
+                return e.path
+        self._fresh(force=True)
+        for e in self._entries.values():
+            if e.kind == "artifact" and hmac.compare_digest(self.art_key(e.path), key):
+                return e.path
+        raise NotFound("no such artifact (it may have been renamed or deleted)")
+
+    def _art(self, aid: str) -> Entry:
+        e = self._entry(aid)
+        if e.kind != "artifact":
+            raise ValueError(f"{e.path} is a {e.kind}, not an artifact (a folder with index.html)")
+        return e
+
+    def _art_files(self, aid: str) -> list[tuple[str, Path, os.stat_result]]:
+        base = self.root / aid
+        out = []
+        for dirpath, dirnames, filenames in os.walk(base):
+            dirnames[:] = sorted(d for d in dirnames if not F.skipped(d) and not os.path.islink(os.path.join(dirpath, d)))
+            for fn in sorted(filenames):
+                if F.skipped(fn):
+                    continue
+                p = Path(dirpath) / fn
+                if p.is_symlink():
+                    continue
+                try:
+                    st = p.stat()
+                except OSError:
+                    continue
+                out.append((p.relative_to(base).as_posix(), p, st))
+        return out
+
+    def _target(self, aid: str, rel: str) -> Path:
+        """Where to write a file of an artifact: never through a link to somewhere outside it."""
+        base = (self.root / aid).resolve()
+        p = base / rel
+        if not p.parent.resolve().is_relative_to(base) or p.is_symlink():
+            raise ValueError(f"{rel} leads outside the artifact folder (a link?); not writing it")
+        return p
+
+    def _pending(self, aid: str) -> dict[str, list]:
+        return dict((self._local_json("uploads.json", {}).get(aid) or {}).get("pending") or {})
+
+    def _art_summary(self, e: Entry) -> dict[str, Any]:
+        files = self._art_files(e.path)
+        pending = self._pending(e.path)
+        latest = max([st.st_mtime_ns for _, _, st in files], default=e.mtime_ns)
+        return {
+            "url": self.art_url(e.path),
+            "files": len(files) + sum(1 for p in pending if not any(r == p for r, _, _ in files)),
+            "bytes": sum(st.st_size for r, _, st in files if r not in pending) + sum(int(v[1]) for v in pending.values()),
+            "pending": len(pending),
+            "stamp": _stamp([[r, st.st_size, st.st_mtime_ns] for r, _, st in files] + [[f"pending:{p}", 0, 0] for p in pending]),
+            "updated_at": iso(latest),
+        }
 
     def artifact_meta(self, aid: str) -> dict[str, Any]:
-        rows = self._q("SELECT * FROM artifacts WHERE id=?", (aid,))
-        if not rows:
-            raise NotFound(f"artifact {aid} not found")
-        return dict(rows[0])
+        e = self._art(aid)
+        return {"id": e.path, "title": self._title(e), "description": e.meta.get("description") or "", **self._art_summary(e)}
+
+    def stamp(self, aid: str) -> int:
+        return self._art_summary(self._art(aid))["stamp"]
 
     def list_artifacts(self) -> list[dict[str, Any]]:
-        rows = self._q(
-            "SELECT a.*, (SELECT COUNT(*) FROM artifact_files f WHERE f.artifact_id=a.id AND f.version=a.latest) files,"
-            " (SELECT COALESCE(SUM(COALESCE(f.size, LENGTH(f.content))),0) FROM artifact_files f"
-            "  WHERE f.artifact_id=a.id AND f.version=a.latest) bytes,"
-            " (SELECT COUNT(*) FROM artifact_files f WHERE f.artifact_id=a.id AND f.version=a.latest AND f.pending=1) pending"
-            " FROM artifacts a ORDER BY a.updated_at DESC"
-        )
-        return [dict(r) for r in rows]
+        self._fresh()
+        arts = [self.artifact_meta(e.path) for e in self._entries.values() if e.kind == "artifact"]
+        return sorted(arts, key=lambda a: a["updated_at"], reverse=True)
 
-    def get_artifact(self, aid: str, version: int | None = None, with_content: bool = False) -> dict[str, Any]:
+    def get_artifact(self, aid: str, with_content: bool = False) -> dict[str, Any]:
         a = self.artifact_meta(aid)
-        v = version or a["latest"]
-        if not 1 <= v <= a["latest"]:
-            raise NotFound(f"artifact {aid} has no version {v}")
+        pending = self._pending(a["id"])
         files = []
-        for r in self._q(
-            "SELECT path, content, content_type, sha256, size, pending FROM artifact_files"
-            " WHERE artifact_id=? AND version=? ORDER BY path", (aid, v)
-        ):
-            f: dict[str, Any] = {
-                "path": r["path"], "content_type": r["content_type"],
-                "size": r["size"] if r["size"] is not None else len(r["content"]),
-            }
-            if r["pending"]:
-                f.update(pending=True, sha256=r["sha256"])
-            elif with_content:
-                if r["content_type"].startswith("text/") or "json" in r["content_type"] or "svg" in r["content_type"]:
-                    f["content"], f["encoding"] = bytes(r["content"]).decode("utf-8", "replace"), "text"
+        for rel, p, st in self._art_files(a["id"]):
+            if rel in pending:
+                continue
+            f: dict[str, Any] = {"path": rel, "content_type": content_type(rel), "size": st.st_size}
+            if with_content:
+                data = p.read_bytes()
+                ct = f["content_type"]
+                if ct.startswith("text/") or "json" in ct or "svg" in ct or "javascript" in ct:
+                    f["content"], f["encoding"] = data.decode("utf-8", "replace"), "text"
                 else:
-                    f["content"], f["encoding"] = base64.b64encode(r["content"]).decode(), "base64"
+                    f["content"], f["encoding"] = base64.b64encode(data).decode(), "base64"
             files.append(f)
-        versions = [dict(r) for r in self._q(
-            "SELECT version, note, source, created_at FROM artifact_versions WHERE artifact_id=? ORDER BY version", (aid,)
-        )]
-        return {**a, "version": v, "files": files, "versions": versions, "pending": sum(1 for f in files if f.get("pending"))}
+        for rel, (h, size) in sorted(pending.items()):
+            files.append({"path": rel, "content_type": content_type(rel), "size": size, "pending": True, "sha256": h})
+        files.sort(key=lambda f: f["path"])
+        return {**a, "entry": "index.html", "files": files}
 
-    def artifact_file(self, aid: str, version: int | None, path: str) -> tuple[bytes, str]:
-        a = self.artifact_meta(aid)
-        v = version or a["latest"]
-        rows = self._q(
-            "SELECT content, content_type, pending FROM artifact_files WHERE artifact_id=? AND version=? AND path=?",
-            (aid, v, path or a["entry"]),
-        )
-        if not rows:
-            raise NotFound(f"{path or a['entry']} not in artifact {aid} v{v}")
-        if rows[0]["pending"]:
-            raise NotFound(f"{path or a['entry']} has not been uploaded yet")
-        return bytes(rows[0]["content"]), rows[0]["content_type"]
+    def artifact_file(self, aid: str, path: str) -> tuple[bytes, str]:
+        rel = clean_art_path(path or "index.html")
+        if rel in self._pending(aid):
+            raise NotFound(f"{rel} has not been uploaded yet")
+        base = (self.root / aid).resolve()
+        p = (base / rel).resolve()
+        if not p.is_relative_to(base) or not p.is_file():
+            raise NotFound(f"{rel} not in artifact {aid}")
+        return p.read_bytes(), content_type(rel)
 
     @staticmethod
     def _shadow(item: Any) -> tuple[str, int]:
@@ -747,79 +1199,39 @@ class WorkspaceStore:
             raise ValueError("a shadow file needs its size in bytes")
         return h, size
 
-    def _write_version(
-        self,
-        db,
-        aid: str,
-        version: int,
-        files: dict[str, bytes],
-        note: str,
-        source: str | None,
-        shadows: dict[str, tuple[str, int]] | None = None,
-    ) -> None:
-        shadows = shadows or {}
-        total = sum(len(b) for b in files.values()) + sum(s for _, s in shadows.values())
+    def _set_uploads(self, aid: str, pending: dict[str, list], rotate: bool) -> None:
+        ups = self._local_json("uploads.json", {})
+        cur = ups.get(aid) or {}
+        if rotate or not cur.get("token"):
+            cur["token"] = secrets.token_urlsafe(24)
+            cur["expires"] = time.time() + UPLOAD_TTL_SECONDS
+        cur["pending"] = pending
+        if pending or cur.get("token"):
+            ups[aid] = cur
+        self._save_local_json("uploads.json", ups)
+
+    def _fill_from_existing(self, aid: str, pending: dict[str, list]) -> None:
+        """Shadow files whose content the artifact already has are filled at once."""
+        if not pending:
+            return
+        by_size: dict[int, list[Path]] = {}
+        for rel, p, st in self._art_files(aid):
+            if rel not in pending:
+                by_size.setdefault(st.st_size, []).append(p)
+        for rel, (h, size) in list(pending.items()):
+            for p in by_size.get(int(size), []):
+                data = p.read_bytes()
+                if hashlib.sha256(data).hexdigest() == h:
+                    F.write_bytes(self._target(aid, rel), data)
+                    pending.pop(rel)
+                    break
+
+    def _check_size(self, aid: str | None, files: dict[str, bytes], shadow: dict[str, tuple[str, int]], drop: set[str]) -> None:
+        total = sum(len(b) for b in files.values()) + sum(s for _, s in shadow.values())
+        if aid:
+            total += sum(st.st_size for rel, _, st in self._art_files(aid) if rel not in files and rel not in shadow and rel not in drop)
         if total > ARTIFACT_MAX_BYTES:
-            raise ValueError(f"artifact is {total} bytes; the limit is {ARTIFACT_MAX_BYTES}")
-        db.execute(
-            "INSERT INTO artifact_versions(artifact_id,version,note,source,created_at) VALUES(?,?,?,?,?)",
-            (aid, version, note or "", source, now()),
-        )
-        rows = [
-            (aid, version, path, sqlite3.Binary(data), content_type(path), hashlib.sha256(data).hexdigest(), len(data), 0)
-            for path, data in files.items()
-        ]
-        rows += [(aid, version, path, b"", content_type(path), h, size, 1) for path, (h, size) in shadows.items()]
-        db.executemany(
-            "INSERT INTO artifact_files(artifact_id,version,path,content,content_type,sha256,size,pending)"
-            " VALUES(?,?,?,?,?,?,?,?)",
-            rows,
-        )
-
-    def _rotate_upload(self, db, aid: str) -> str:
-        token = secrets.token_urlsafe(24)
-        db.execute(
-            "INSERT INTO artifact_upload(artifact_id, token, expires) VALUES(?,?,?)"
-            " ON CONFLICT(artifact_id) DO UPDATE SET token=excluded.token, expires=excluded.expires",
-            (aid, token, time.time() + UPLOAD_TTL_SECONDS),
-        )
-        return token
-
-    def upload_links(self, aid: str, rotate: bool = False) -> dict[str, Any]:
-        """The current upload secret and the files still waiting for it. rotate=True replaces
-        the secret, which also renews an expired one."""
-        self.artifact_meta(aid)
-        with self._tx() as db:
-            row = db.execute("SELECT token, expires FROM artifact_upload WHERE artifact_id=?", (aid,)).fetchone()
-            if rotate or not row or row["expires"] < time.time():
-                token, expires = self._rotate_upload(db, aid), time.time() + UPLOAD_TTL_SECONDS
-            else:
-                token, expires = row["token"], row["expires"]
-        a = self.get_artifact(aid)
-        return {
-            "token": token,
-            "expires_in_minutes": max(0, int((expires - time.time()) / 60)),
-            "pending": [{"path": f["path"], "sha256": f["sha256"], "size": f["size"]} for f in a["files"] if f.get("pending")],
-        }
-
-    def _fill_from_existing(self, db, aid: str, version: int) -> list[str]:
-        """Shadow files whose content the artifact already has (any version) are filled at once."""
-        filled = []
-        pending = db.execute(
-            "SELECT path, sha256, size FROM artifact_files WHERE artifact_id=? AND version=? AND pending=1", (aid, version)
-        ).fetchall()
-        for p in pending:
-            src = db.execute(
-                "SELECT content FROM artifact_files WHERE artifact_id=? AND sha256=? AND pending=0 LIMIT 1",
-                (aid, p["sha256"]),
-            ).fetchone()
-            if src and len(src["content"]) == p["size"]:
-                db.execute(
-                    "UPDATE artifact_files SET content=?, pending=0 WHERE artifact_id=? AND version=? AND path=?",
-                    (src["content"], aid, version, p["path"]),
-                )
-                filled.append(p["path"])
-        return filled
+            raise ValueError(f"artifact would be {total} bytes; the limit is {ARTIFACT_MAX_BYTES}")
 
     def create_artifact(
         self,
@@ -830,26 +1242,41 @@ class WorkspaceStore:
         source: str | None = None,
         note: str = "",
         shadows: dict[str, Any] | None = None,
+        parent_id: str | None = None,
+        category: str | None = None,
+        tags: list[str] | None = None,
     ) -> dict[str, Any]:
-        files = {clean_path(p): b for p, b in files.items()}
-        shadow = {clean_path(p): self._shadow(s) for p, s in (shadows or {}).items()}
+        files = {clean_art_path(p): b for p, b in files.items()}
+        shadow = {clean_art_path(p): self._shadow(s) for p, s in (shadows or {}).items()}
         if set(files) & set(shadow):
             raise ValueError(f"given both with content and as a shadow file: {', '.join(sorted(set(files) & set(shadow)))}")
-        entry = clean_path(entry)
-        if entry not in files and entry not in shadow:
-            raise ValueError(f"the entry file {entry} is missing; files given: {', '.join([*files, *shadow]) or 'none'}")
-        aid = new_id("a", 16)  # long: artifact pages are served without the token
-        t = now()
-        with self._tx() as db:
-            db.execute(
-                "INSERT INTO artifacts(id,title,description,entry,latest,source,created_at,updated_at) VALUES(?,?,?,?,1,?,?,?)",
-                (aid, title, description or "", entry, source, t, t),
-            )
-            self._write_version(db, aid, 1, files, note or "first version", source, shadow)
-            self._fill_from_existing(db, aid, 1)
-            self._rotate_upload(db, aid)
+        if (entry or "index.html") != "index.html":
+            raise ValueError("an artifact's page must be index.html; name the entry page that")
+        if "index.html" not in files and "index.html" not in shadow:
+            raise ValueError(f"index.html is missing; files given: {', '.join([*files, *shadow]) or 'none'}")
+        self._check_size(None, files, shadow, set())
+        title = (title or "").strip() or "Untitled"
+        with self._lock:
+            self._fresh(force=True)
+            parent = self._folder(parent_id)
+            path = self._new_path(parent, title, "")
+            base = self.root / path
+            base.mkdir(parents=True)
+            for rel, data in files.items():
+                F.write_bytes(self._target(path, rel), data)
+            if "index.html" in shadow:  # marks the folder as an artifact until the real page arrives
+                F.write_text(self._target(path, "index.html"), "<!doctype html><p>Waiting for index.html to be uploaded.</p>")
+            self._set_yaml_meta(path, {
+                "title": self._title_meta(title, path, True), "description": description or None,
+                "category": category or None, "tags": list(tags or []) or None, "source": source or None,
+            })
+            pending = {p: [h, s] for p, (h, s) in shadow.items()}
+            self._fill_from_existing(path, pending)
+            self._set_uploads(path, pending, rotate=True)
+            self._ensure_category(category)
+            self._dirty = True
         self.changed("artifacts")
-        return self.get_artifact(aid)
+        return self.get_artifact(path)
 
     def update_artifact(
         self,
@@ -863,213 +1290,230 @@ class WorkspaceStore:
         source: str | None = None,
         shadows: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
-        """New version = latest files (shadow files still waiting carry over), plus/overwritten by
-        `files` and `shadows`, minus `remove`. Every publish replaces the upload secret.
-        Changing only title/description doesn't make a new version."""
-        a = self.artifact_meta(aid)
-        new_files = {clean_path(p): b for p, b in (files or {}).items()}
-        new_shadow = {clean_path(p): self._shadow(s) for p, s in (shadows or {}).items()}
+        """Write the given files into the artifact folder, register shadow files, delete the
+        paths in `remove`. Every change to files replaces the upload secret."""
+        if entry and entry != "index.html":
+            raise ValueError("an artifact's page must be index.html")
+        new_files = {clean_art_path(p): b for p, b in (files or {}).items()}
+        new_shadow = {clean_art_path(p): self._shadow(s) for p, s in (shadows or {}).items()}
         if set(new_files) & set(new_shadow):
             raise ValueError("a path is given both with content and as a shadow file")
-        drop = {clean_path(p) for p in (remove or [])}
-        entry = clean_path(entry) if entry else a["entry"]
-        with self._tx() as db:
-            sets = {"updated_at": now()}
-            if title is not None:
-                sets["title"] = title
-            if description is not None:
-                sets["description"] = description
-            if new_files or new_shadow or drop or entry != a["entry"]:
-                content: dict[str, bytes] = {}
-                shadow: dict[str, tuple[str, int]] = {}
-                for r in db.execute(
-                    "SELECT path, content, sha256, size, pending FROM artifact_files WHERE artifact_id=? AND version=?",
-                    (aid, a["latest"]),
-                ):
-                    if r["pending"]:
-                        shadow[r["path"]] = (r["sha256"], r["size"])
-                    else:
-                        content[r["path"]] = bytes(r["content"])
-                missing = drop - set(content) - set(shadow)
-                if missing:
-                    raise ValueError(f"not in the artifact: {', '.join(sorted(missing))}")
-                for p in drop | set(new_files) | set(new_shadow):
-                    content.pop(p, None)
-                    shadow.pop(p, None)
-                content.update(new_files)
-                shadow.update(new_shadow)
-                if entry not in content and entry not in shadow:
-                    raise ValueError(f"the entry file {entry} would be missing")
-                v = a["latest"] + 1
-                self._write_version(db, aid, v, content, note, source, shadow)
-                self._fill_from_existing(db, aid, v)
-                self._rotate_upload(db, aid)
-                sets.update(latest=v, entry=entry)
-            cols = ", ".join(f"{k}=?" for k in sets)
-            db.execute(f"UPDATE artifacts SET {cols} WHERE id=?", (*sets.values(), aid))
-            self._touch_cards(db, aid, sets["updated_at"])
+        drop = {clean_art_path(p) for p in (remove or [])}
+        if "index.html" in drop and "index.html" not in new_files and "index.html" not in new_shadow:
+            raise ValueError("index.html can't be removed; it is what makes the folder an artifact")
+        with self._lock:
+            e = self._art(aid)
+            aid = e.path
+            pending = self._pending(aid)
+            have = {rel for rel, _, _ in self._art_files(aid)} | set(pending)
+            missing = drop - have
+            if missing:
+                raise ValueError(f"not in the artifact: {', '.join(sorted(missing))}")
+            self._check_size(aid, new_files, new_shadow, drop)
+            base = self.root / aid
+            for rel in drop:
+                pending.pop(rel, None)
+                p = self._target(aid, rel)
+                if p.is_file():
+                    p.unlink()
+            for rel, data in new_files.items():
+                F.write_bytes(self._target(aid, rel), data)
+                pending.pop(rel, None)
+            for rel, (h, s) in new_shadow.items():
+                pending[rel] = [h, s]
+            changed_files = bool(new_files or new_shadow or drop)
+            if changed_files:
+                self._fill_from_existing(aid, pending)
+                self._set_uploads(aid, pending, rotate=True)
+            if description is not None or source is not None:
+                meta = dict(e.meta)
+                if description is not None:
+                    meta["description"] = description or None
+                if source is not None:
+                    meta["source"] = source or None
+                self._set_yaml_meta(aid, meta)
+            self._dirty = True
+        if title is not None and title.strip() and title.strip() != self._title(e):
+            aid = self.update_finding(aid, title=title)["id"]
         self.changed("artifacts")
-        self._art_event(aid, "version")
+        if changed_files:
+            self._art_event(aid, "version")
         return self.get_artifact(aid)
 
-    def _touch_cards(self, db, aid: str, t: str) -> None:
-        # Cards showing this artifact re-render when their finding changes.
-        db.execute(
-            "UPDATE findings SET updated_at=? WHERE kind='artifact' AND (content=? OR content LIKE ?)", (t, aid, aid + "@%")
-        )
+    def upload_links(self, aid: str, rotate: bool = False) -> dict[str, Any]:
+        """The current upload secret and the files still waiting for it. rotate=True replaces
+        the secret, which also renews an expired one."""
+        aid = self._art(aid).path
+        cur = self._local_json("uploads.json", {}).get(aid) or {}
+        if rotate or not cur.get("token") or cur.get("expires", 0) < time.time():
+            self._set_uploads(aid, self._pending(aid), rotate=True)
+            cur = self._local_json("uploads.json", {}).get(aid) or {}
+        pending = cur.get("pending") or {}
+        return {
+            "token": cur["token"],
+            "expires_in_minutes": max(0, int((cur["expires"] - time.time()) / 60)),
+            "pending": [{"path": p, "sha256": h, "size": s} for p, (h, s) in sorted(pending.items())],
+        }
 
     def receive_upload(self, token: str, digest: str, data: bytes) -> dict[str, Any]:
-        """Fill the latest version's shadow files that have this hash, via an upload link."""
-        with self._tx() as db:
-            row = db.execute("SELECT artifact_id, expires FROM artifact_upload WHERE token=?", (token,)).fetchone()
-            if not row:
+        """Fill shadow files that have this hash, via an upload link."""
+        with self._lock:
+            ups = self._local_json("uploads.json", {})
+            aid = next((a for a, u in ups.items() if u.get("token") and hmac.compare_digest(u["token"], token)), None)
+            if aid is None:
                 raise NotFound("this upload link is not valid; a newer publish replaced it, ask for fresh links")
-            if row["expires"] < time.time():
+            if ups[aid].get("expires", 0) < time.time():
                 raise NotFound("this upload link has expired; ask for fresh links (upload_links)")
-            out = self._fill(db, row["artifact_id"], digest, data)
+            out = self._fill(aid, digest, data)
         self.changed("artifacts")
-        self._art_event(out["artifact_id"], "version")
+        self._art_event(aid, "version")
         return out
 
     def fill_shadow(self, aid: str, digest: str, data: bytes) -> dict[str, Any]:
         """Fill shadow files directly, e.g. from a file on this computer."""
-        self.artifact_meta(aid)
-        with self._tx() as db:
-            out = self._fill(db, aid, digest, data)
+        aid = self._art(aid).path
+        with self._lock:
+            out = self._fill(aid, digest, data)
         self.changed("artifacts")
         self._art_event(aid, "version")
         return out
 
-    def _fill(self, db, aid: str, digest: str, data: bytes) -> dict[str, Any]:
+    def _fill(self, aid: str, digest: str, data: bytes) -> dict[str, Any]:
         digest = digest.lower()
-        latest = db.execute("SELECT latest FROM artifacts WHERE id=?", (aid,)).fetchone()["latest"]
-        targets = db.execute(
-            "SELECT path, size FROM artifact_files WHERE artifact_id=? AND version=? AND sha256=? AND pending=1",
-            (aid, latest, digest),
-        ).fetchall()
+        pending = self._pending(aid)
+        targets = [p for p, (h, _) in pending.items() if h == digest]
         if not targets:
             raise NotFound("no file waiting for upload has that hash (it may have arrived already)")
         got = hashlib.sha256(data).hexdigest()
         if got != digest:
             raise ValueError(f"content does not match the hash: expected {digest}, got {got}")
-        if len(data) != targets[0]["size"]:
-            raise ValueError(f"expected {targets[0]['size']} bytes, got {len(data)}")
-        db.executemany(
-            "UPDATE artifact_files SET content=?, pending=0 WHERE artifact_id=? AND version=? AND path=?",
-            [(sqlite3.Binary(data), aid, latest, t["path"]) for t in targets],
-        )
-        left = db.execute(
-            "SELECT COUNT(*) FROM artifact_files WHERE artifact_id=? AND version=? AND pending=1", (aid, latest)
-        ).fetchone()[0]
-        t = now()
-        db.execute("UPDATE artifacts SET updated_at=? WHERE id=?", (t, aid))
-        self._touch_cards(db, aid, t)
-        return {"artifact_id": aid, "version": latest, "stored": [t["path"] for t in targets], "still_waiting": left}
+        if len(data) != int(pending[targets[0]][1]):
+            raise ValueError(f"expected {pending[targets[0]][1]} bytes, got {len(data)}")
+        for t in targets:
+            F.write_bytes(self._target(aid, t), data)
+            pending.pop(t)
+        ups = self._local_json("uploads.json", {})
+        ups.setdefault(aid, {})["pending"] = pending
+        self._save_local_json("uploads.json", ups)
+        self._dirty = True
+        return {"artifact_id": aid, "stored": sorted(targets), "still_waiting": len(pending)}
 
     def delete_artifact(self, aid: str) -> dict[str, Any]:
-        self.artifact_meta(aid)
-        with self._tx() as db:
-            n = db.execute(
-                "DELETE FROM findings WHERE kind='artifact' AND (content=? OR content LIKE ?)", (aid, aid + "@%")
-            ).rowcount
-            db.execute("DELETE FROM artifacts WHERE id=?", (aid,))
-        self.changed("artifacts")
-        self._art_event(aid, "deleted")
-        return {"deleted": aid, "cards_removed": n}
+        aid = self._art(aid).path
+        out = self.delete_finding(aid, recursive=True)
+        return {"deleted": aid, "trashed_to": out["trashed_to"]}
 
     # ---- artifact database --------------------------------------------
     # Each artifact gets a small document store its pages use through window.claude.use("db").
-    # `rev` goes up on every write so pages can poll cheaply.
+    # A collection is a JSON file under the artifact's .data folder.
+
+    def _coll_file(self, aid: str, collection: str) -> Path:
+        segs = [urllib.parse.quote(s, safe="-_.~@+") for s in check_collection(collection).split("/")]
+        return self._target(aid, "/".join([".data", *segs[:-1], f"{segs[-1]}.json"]))
+
+    def _coll(self, aid: str, collection: str) -> dict[str, Any]:
+        p = self._coll_file(aid, collection)
+        try:
+            data = json.loads(p.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            return {}
+        except ValueError as e:
+            raise ValueError(f"{p.name} in the artifact's .data folder is not valid JSON: {e}") from e
+        return data if isinstance(data, dict) else {}
 
     def db_rev(self, aid: str) -> int:
-        rows = self._q("SELECT rev FROM artifact_db_rev WHERE artifact_id=?", (aid,))
-        return rows[0]["rev"] if rows else 0
+        base = self.root / aid / ".data"
+        items = []
+        for dirpath, _, filenames in os.walk(base):
+            for fn in filenames:
+                if fn.endswith(".json"):
+                    try:
+                        st = os.stat(os.path.join(dirpath, fn))
+                    except OSError:
+                        continue
+                    items.append([os.path.join(dirpath, fn), st.st_size, st.st_mtime_ns])
+        return _stamp(items)
 
     @staticmethod
-    def _doc_row(r: sqlite3.Row) -> dict[str, Any]:
-        return {"id": r["doc_id"], "data": json.loads(r["data"]), "version": r["version"], "updatedAt": r["updated_at"]}
+    def _doc_out(doc_id: str, d: dict[str, Any]) -> dict[str, Any]:
+        return {"id": doc_id, "data": d.get("data"), "version": d.get("version", 1), "updatedAt": d.get("updatedAt")}
 
     def db_list(self, aid: str, collection: str) -> list[dict[str, Any]]:
-        self.artifact_meta(aid)
-        check_collection(collection)
-        return [self._doc_row(r) for r in self._q(
-            "SELECT * FROM artifact_docs WHERE artifact_id=? AND collection=? ORDER BY doc_id", (aid, collection)
-        )]
+        aid = self._art(aid).path
+        return [self._doc_out(k, v) for k, v in sorted(self._coll(aid, collection).items()) if isinstance(v, dict)]
 
     def db_collections(self, aid: str) -> list[dict[str, Any]]:
-        self.artifact_meta(aid)
-        return [dict(r) for r in self._q(
-            "SELECT collection, COUNT(*) docs FROM artifact_docs WHERE artifact_id=? GROUP BY collection ORDER BY collection",
-            (aid,),
-        )]
+        aid = self._art(aid).path
+        base = self.root / aid / ".data"
+        out = []
+        for p in sorted(base.rglob("*.json")) if base.is_dir() else []:
+            rel = p.relative_to(base).as_posix()[: -len(".json")]
+            name = "/".join(urllib.parse.unquote(s) for s in rel.split("/"))
+            try:
+                out.append({"collection": name, "docs": len(self._coll(aid, name))})
+            except ValueError:
+                continue
+        return out
 
     def db_get(self, aid: str, collection: str, doc_id: str) -> dict[str, Any]:
-        self.artifact_meta(aid)
-        rows = self._q(
-            "SELECT * FROM artifact_docs WHERE artifact_id=? AND collection=? AND doc_id=?",
-            (aid, check_collection(collection), check_doc_id(doc_id)),
-        )
-        if not rows:
+        aid = self._art(aid).path
+        d = self._coll(aid, collection).get(check_doc_id(doc_id))
+        if not isinstance(d, dict):
             raise NotFound(f"no document {collection}/{doc_id}")
-        return self._doc_row(rows[0])
+        return self._doc_out(doc_id, d)
 
-    def _bump(self, db, aid: str) -> None:
-        db.execute(
-            "INSERT INTO artifact_db_rev(artifact_id, rev) VALUES(?, 1) ON CONFLICT(artifact_id) DO UPDATE SET rev=rev+1",
-            (aid,),
-        )
+    def _save_coll(self, aid: str, collection: str, docs: dict[str, Any]) -> None:
+        F.write_text(self._coll_file(aid, collection), json.dumps(docs, indent=1, ensure_ascii=False, sort_keys=True) + "\n")
 
     def db_write(
         self, aid: str, collection: str, doc_id: str, data: Any, merge: bool = False, if_version: int | None = None
     ) -> dict[str, Any]:
-        self.artifact_meta(aid)
-        check_collection(collection)
+        aid = self._art(aid).path
         check_doc_id(doc_id)
         if not isinstance(data, dict):
             raise ValueError("a document must be a JSON object")
-        with self._tx() as db:
-            cur = db.execute(
-                "SELECT data, version FROM artifact_docs WHERE artifact_id=? AND collection=? AND doc_id=?",
-                (aid, collection, doc_id),
-            ).fetchone()
-            if if_version is not None and (cur["version"] if cur else 0) != if_version:
-                raise Conflict(f"{collection}/{doc_id} is at version {cur['version'] if cur else 0}, not {if_version}")
-            new = merge_doc(json.loads(cur["data"]), data) if (merge and cur) else (merge_doc({}, data) if merge else data)
-            text = json.dumps(new, ensure_ascii=False)
-            if len(text.encode()) > DOC_MAX_BYTES:
+        with self._lock:
+            docs = self._coll(aid, collection)
+            cur = docs.get(doc_id) if isinstance(docs.get(doc_id), dict) else None
+            cur_v = cur.get("version", 1) if cur else 0
+            if if_version is not None and cur_v != if_version:
+                raise Conflict(f"{collection}/{doc_id} is at version {cur_v}, not {if_version}")
+            new = merge_doc(cur.get("data"), data) if (merge and cur) else (merge_doc({}, data) if merge else data)
+            if len(json.dumps(new, ensure_ascii=False).encode()) > DOC_MAX_BYTES:
                 raise ValueError(f"document is larger than {DOC_MAX_BYTES} bytes")
-            version = (cur["version"] if cur else 0) + 1
             t = now()
-            db.execute(
-                "INSERT INTO artifact_docs(artifact_id,collection,doc_id,data,version,updated_at) VALUES(?,?,?,?,?,?)"
-                " ON CONFLICT(artifact_id,collection,doc_id) DO UPDATE SET data=excluded.data, version=excluded.version,"
-                " updated_at=excluded.updated_at",
-                (aid, collection, doc_id, text, version, t),
-            )
-            self._bump(db, aid)
+            docs[doc_id] = {"data": new, "version": cur_v + 1, "updatedAt": t}
+            self._save_coll(aid, collection, docs)
         self._art_event(aid, "db")
-        return {"id": doc_id, "data": new, "version": version, "updatedAt": t}
+        return {"id": doc_id, "data": new, "version": cur_v + 1, "updatedAt": t}
 
     def db_delete(self, aid: str, collection: str, doc_id: str, if_version: int | None = None) -> None:
-        self.artifact_meta(aid)
-        check_collection(collection)
+        aid = self._art(aid).path
         check_doc_id(doc_id)
-        with self._tx() as db:
-            cur = db.execute(
-                "SELECT version FROM artifact_docs WHERE artifact_id=? AND collection=? AND doc_id=?",
-                (aid, collection, doc_id),
-            ).fetchone()
-            if if_version is not None and (cur["version"] if cur else 0) != if_version:
-                raise Conflict(f"{collection}/{doc_id} is at version {cur['version'] if cur else 0}, not {if_version}")
-            db.execute(
-                "DELETE FROM artifact_docs WHERE artifact_id=? AND collection=? AND doc_id=?", (aid, collection, doc_id)
-            )
-            self._bump(db, aid)
+        with self._lock:
+            docs = self._coll(aid, collection)
+            cur = docs.get(doc_id) if isinstance(docs.get(doc_id), dict) else None
+            cur_v = cur.get("version", 1) if cur else 0
+            if if_version is not None and cur_v != if_version:
+                raise Conflict(f"{collection}/{doc_id} is at version {cur_v}, not {if_version}")
+            if cur is not None:
+                docs.pop(doc_id)
+                self._save_coll(aid, collection, docs)
         self._art_event(aid, "db")
+
+    # ---- raw files --------------------------------------------------------
+    def raw_file(self, path: str) -> Path:
+        """A file in the workspace, for images and downloads. Nothing hidden, nothing outside."""
+        rel = F.clean_rel(path)
+        p = (self.root / rel).resolve()
+        if not p.is_relative_to(self.root) or not p.is_file():
+            raise NotFound(f"{rel} not found")
+        return p
 
     # ---- views ----------------------------------------------------------
     def state(self) -> dict[str, Any]:
         """Everything the UI needs for this workspace."""
+        self._fresh()
         return {
             "workspace": self.summary(),
             "settings": self.settings(),
@@ -1077,131 +1521,213 @@ class WorkspaceStore:
             "boards": self.list_boards(),
             "placements": self.placements(),
             "artifacts": self.list_artifacts(),
+            "problems": list(self.problems),
         }
 
     def board_view(self, bid: str) -> dict[str, Any]:
         """A board as an agent sees it: placements with titles and bounds problems."""
+        self._fresh()
         board = self.get_board_row(bid)
-        titles = {
-            r["id"]: (r["title"], r["kind"], r["category"])
-            for r in self._q("SELECT id,title,kind,category FROM findings")
-        }
         placed = []
         for p in self.placements(board["id"]):
-            t = titles.get(p["finding_id"], ("?", "?", None))
+            e = self._entries.get(p["finding_id"])
             out = p["x"] < 0 or p["y"] < 0 or p["x"] + p["w"] > board["width"] or p["y"] + p["h"] > board["height"]
-            placed.append(
-                {
-                    "finding_id": p["finding_id"],
-                    "title": t[0],
-                    "kind": t[1],
-                    "category": t[2],
-                    "x": p["x"],
-                    "y": p["y"],
-                    "w": p["w"],
-                    "h": p["h"],
-                    "z": p["z"],
-                    "out_of_bounds": out,
-                }
-            )
+            item = {
+                "finding_id": p["finding_id"],
+                "title": self._title(e) if e else p["finding_id"],
+                "kind": e.kind if e else "missing",
+                "category": (e.meta.get("category") or None) if e else None,
+                **{k: p[k] for k in ("x", "y", "w", "h", "z")},
+                "out_of_bounds": out,
+            }
+            if not e:
+                item["missing"] = True
+            placed.append(item)
         return {
             "board": board,
             "placements": placed,
             "out_of_bounds": [p["finding_id"] for p in placed if p["out_of_bounds"]],
+            "missing": [p["finding_id"] for p in placed if p.get("missing")],
         }
 
 
 class Registry:
-    """All workspaces under a data directory."""
+    """The workspaces this computer knows about: a list of folders in <data>/workspaces.yaml."""
 
-    def __init__(self, data_dir: Path, notify: Notify | None = None):
+    def __init__(self, data_dir: Path, notify: Notify | None = None, default_root: Path | None = None):
         self.data_dir = Path(data_dir)
-        self.ws_dir = self.data_dir / "workspaces"
-        self.trash_dir = self.data_dir / "trash"
-        self.ws_dir.mkdir(parents=True, exist_ok=True)
+        self.data_dir.mkdir(parents=True, exist_ok=True)
+        self.list_file = self.data_dir / "workspaces.yaml"
+        self.default_root = Path(default_root).expanduser() if default_root else Path.home() / "Ritboard"
         self.notify: Notify = notify or (lambda ws, what: None)
+        self.secret = self._load_secret()
         self._stores: dict[str, WorkspaceStore] = {}
+        self._items: list[dict[str, str]] = []
+        self._sig: tuple[int, int] | None = None
         self._lock = threading.RLock()
+
+    def _load_secret(self) -> bytes:
+        p = self.data_dir / "secret"
+        try:
+            return p.read_text().strip().encode()
+        except FileNotFoundError:
+            s = secrets.token_hex(32)
+            F.write_text(p, s + "\n")
+            return s.encode()
 
     def _notify(self, ws: str, what: str) -> None:
         self.notify(ws, what)
 
-    def _open(self, ws_id: str) -> WorkspaceStore:
+    def _load(self) -> list[dict[str, str]]:
         with self._lock:
-            st = self._stores.get(ws_id)
-            if st is None:
-                path = self.ws_dir / f"{ws_id}.sqlite"
-                if not path.exists():
-                    raise NotFound(f"workspace {ws_id} not found")
-                st = WorkspaceStore(path, ws_id, self._notify)
-                self._stores[ws_id] = st
-            return st
+            try:
+                st = self.list_file.stat()
+                sig = (st.st_mtime_ns, st.st_size)
+            except FileNotFoundError:
+                sig = None
+            if sig != self._sig:
+                raw = F.load_yaml(self.list_file) if sig else None
+                items = (raw or {}).get("workspaces") if isinstance(raw, dict) else None
+                self._items = [
+                    {"id": str(i["id"]), "path": str(i["path"])}
+                    for i in (items or []) if isinstance(i, dict) and i.get("id") and i.get("path")
+                ]
+                self._sig = sig
+                for wid in list(self._stores):
+                    if not any(i["id"] == wid and Path(i["path"]).resolve() == self._stores[wid].root for i in self._items):
+                        self._stores.pop(wid)
+            return list(self._items)
+
+    def _save(self) -> None:
+        F.write_text(self.list_file, F.dump_yaml({"workspaces": self._items}))
+        self._sig = None
 
     def ids(self) -> list[str]:
-        return sorted(p.stem for p in self.ws_dir.glob("*.sqlite"))
+        return [i["id"] for i in self._load()]
+
+    def _open(self, item: dict[str, str]) -> WorkspaceStore:
+        with self._lock:
+            st = self._stores.get(item["id"])
+            if st is None:
+                root = Path(item["path"])
+                if not root.is_dir():
+                    raise NotFound(f"workspace {item['id']}: its folder {root} is missing")
+                st = WorkspaceStore(root, item["id"], self._notify, self.secret)
+                self._stores[item["id"]] = st
+            return st
+
+    def open_stores(self) -> list[WorkspaceStore]:
+        out = []
+        for i in self._load():
+            try:
+                out.append(self._open(i))
+            except NotFound:
+                pass
+        return out
 
     def list(self) -> list[dict[str, Any]]:
-        out = [self._open(i).summary() for i in self.ids()]
+        out = []
+        for i in self._load():
+            try:
+                out.append(self._open(i).summary())
+            except NotFound:
+                out.append({"id": i["id"], "name": i["id"], "path": i["path"], "missing": True})
         return sorted(out, key=lambda w: (w["name"] or "").lower())
 
     def get(self, ref: str) -> WorkspaceStore:
-        """Find a workspace by id, or by name (case-insensitive)."""
+        """Find a workspace by id, name (case-insensitive) or folder."""
         if not ref:
             raise NotFound("workspace is required; call list_workspaces to see them")
-        ids = self.ids()
-        if ref in ids:
-            return self._open(ref)
+        items = self._load()
+        for i in items:
+            if i["id"] == ref:
+                return self._open(i)
         low = ref.strip().lower()
-        for i in ids:
-            st = self._open(i)
-            if st.name.lower() == low:
+        for i in items:
+            try:
+                st = self._open(i)
+            except NotFound:
+                continue
+            if st.name.lower() == low or str(st.root).lower() == low.rstrip("/\\"):
                 return st
-        if slugify(ref) in ids:
-            return self._open(slugify(ref))
-        raise NotFound(f"workspace {ref!r} not found; existing: {', '.join(ids) or 'none'}")
+        for i in items:
+            if i["id"] == slugify(ref):
+                return self._open(i)
+        raise NotFound(f"workspace {ref!r} not found; existing: {', '.join(i['id'] for i in items) or 'none'}")
 
-    def create(self, name: str, board_name: str | None = "Main") -> WorkspaceStore:
-        base = slugify(name)
-        ws_id, n = base, 2
+    def _register(self, root: Path, name: str) -> WorkspaceStore:
         with self._lock:
-            while (self.ws_dir / f"{ws_id}.sqlite").exists():
-                ws_id = f"{base}-{n}"
-                n += 1
-            st = WorkspaceStore(self.ws_dir / f"{ws_id}.sqlite", ws_id, self._notify)
-            st.set_meta("name", name.strip() or ws_id)
-            st.set_meta("created_at", now())
-            st.set_meta("settings", json.dumps(DEFAULT_SETTINGS))
-            self._stores[ws_id] = st
-        if board_name:
-            st.create_board(board_name)
+            items = self._load()
+            for i in items:
+                if Path(i["path"]).resolve() == root.resolve():
+                    return self._open(i)
+            base = slugify(name)
+            wid, n = base, 2
+            while any(i["id"] == wid for i in items):
+                wid, n = f"{base}-{n}", n + 1
+            self._items = items + [{"id": wid, "path": str(root)}]
+            self._save()
+            st = self._open({"id": wid, "path": str(root)})
         self._notify("*", "workspaces")
+        return st
+
+    def create(self, name: str, board_name: str | None = "Main", path: str | Path | None = None) -> WorkspaceStore:
+        """Make a new workspace folder: at `path`, or under the default folder by name."""
+        name = name.strip() or "Workspace"
+        if path:
+            root = Path(path).expanduser().resolve()
+            if (root / ".ritboard").exists():
+                raise ValueError(f"{root} is already a workspace; open it with open_workspace")
+            if root.exists() and any(root.iterdir()):
+                raise ValueError(f"{root} is not empty; use open_workspace to use its files as they are")
+        else:
+            base = F.safe_name(name)
+            root = self.default_root / base
+            n = 2
+            while root.exists():
+                root, n = self.default_root / f"{base} {n}", n + 1
+        root.mkdir(parents=True, exist_ok=True)
+        WorkspaceStore(root, "_new", name=name)
+        st = self._register(root, name)
+        if board_name and not st.list_boards():
+            st.create_board(board_name)
+        return st
+
+    def open(self, path: str | Path, name: str | None = None) -> WorkspaceStore:
+        """Use an existing folder as a workspace. Its files stay as they are; Ritboard adds .ritboard/."""
+        root = Path(path).expanduser().resolve()
+        if not root.is_dir():
+            raise ValueError(f"no such folder: {root}")
+        st = self._register(root, WorkspaceStore(root, "_new", name=name or root.name).name)
+        if not st.list_boards():
+            st.create_board("Main")
         return st
 
     def rename(self, ref: str, name: str) -> WorkspaceStore:
         st = self.get(ref)
-        st.set_meta("name", name)
-        st.changed("workspace")
+        st.set_name(name)
         self._notify("*", "workspaces")
         return st
 
-    def delete(self, ref: str) -> str:
-        """Move the workspace file to the trash folder. Nothing is destroyed."""
-        st = self.get(ref)
+    def remove(self, ref: str) -> str:
+        """Forget a workspace. Its folder and files stay where they are."""
         with self._lock:
-            st.close()
-            self._stores.pop(st.id, None)
-            self.trash_dir.mkdir(parents=True, exist_ok=True)
-            dest = self.trash_dir / f"{st.id}-{int(time.time())}.sqlite"
-            shutil.move(str(st.path), dest)
-            for suffix in ("-wal", "-shm"):
-                side = Path(str(st.path) + suffix)
-                if side.exists():
-                    side.unlink()
+            try:
+                st = self.get(ref)
+                wid, path = st.id, str(st.root)
+            except NotFound:
+                item = next((i for i in self._load() if i["id"] == ref), None)
+                if not item:
+                    raise
+                wid, path = item["id"], item["path"]
+            self._items = [i for i in self._load() if i["id"] != wid]
+            self._save()
+            self._stores.pop(wid, None)
         self._notify("*", "workspaces")
-        return str(dest)
+        return path
+
+    delete = remove
 
     def close(self) -> None:
         with self._lock:
-            for st in self._stores.values():
-                st.close()
             self._stores.clear()

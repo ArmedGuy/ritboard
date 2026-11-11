@@ -3,16 +3,15 @@
 // use: `const db = await window.claude.use("db"); db.collection("plan").onSnapshot(...)`.
 // Data lives in the workspace file, next to the artifact. Ritboard pushes changes over a
 // server-sent event stream: database writes by other viewers or agents arrive at once, and
-// a page opened on its own reloads when a new version is published. (Inside a board card
-// the board reloads it.) If the stream drops, the database falls back to polling.
+// a page opened on its own reloads when its files change. (Inside a board card the board
+// reloads it.) If the stream drops, the database falls back to polling.
 (() => {
   'use strict';
-  const m = location.pathname.match(/^(\/w\/[^/]+\/a\/[^/@]+)(?:@\d+)?\//);
+  const m = location.pathname.match(/^(\/w\/[^/]+\/a\/[^/]+)\//);
   if (!m) return;
   const base = m[1] + '/_db';
   const me = document.currentScript;
-  const loadedVersion = Number(me && me.dataset.version) || 0;
-  const pinned = !!(me && 'pinned' in me.dataset);
+  const loadedVersion = Number(me && me.dataset.version) || 0;  // state of the files this page came from
   let topLevel = true;
   try { topLevel = window.self === window.top; } catch { topLevel = false; }
   let live = false;  // event stream connected
@@ -158,12 +157,12 @@
     es.addEventListener('hello', (e) => {
       live = true;
       const { latest } = JSON.parse(e.data);
-      if (!pinned && topLevel && loadedVersion && latest > loadedVersion) location.reload();
+      if (topLevel && loadedVersion && latest && latest !== loadedVersion) location.reload();
     });
     es.addEventListener('db', () => { for (const c of collections.values()) c._kick(); });
     es.addEventListener('version', (e) => {
       const { latest } = JSON.parse(e.data);
-      if (!pinned && topLevel && latest && latest !== loadedVersion) location.reload();
+      if (topLevel && latest && latest !== loadedVersion) location.reload();
     });
     es.addEventListener('deleted', () => { es.close(); });
     es.onerror = () => { live = false; };  // EventSource retries by itself
